@@ -551,6 +551,19 @@ void layer_norm(const float* in, const float* scale, const float* bias,
   // Implementation lifted from:
   // https://github.com/browsermt/marian-dev/blob/7cf2159bc4e9c0c337aa38270081d941c9e59c26/src/tensors/cpu/tensor_operators.cpp#L1103
 
+#ifdef VEXT_W8_AVAILABLE
+  if (cols % VDatum<VExt::w8>::kWidth == 0) {
+    vext::layer_norm<VExt::w8>(in, scale, bias, eps, rows, cols, out);
+    return;
+  }
+#endif
+#ifdef VEXT_W4_AVAILABLE
+  if (cols % VDatum<VExt::w4>::kWidth == 0) {
+    vext::layer_norm<VExt::w4>(in, scale, bias, eps, rows, cols, out);
+    return;
+  }
+#endif
+
   for (size_t j = 0; j < rows; ++j) {
     const float* x = in + j * cols;
     float* y = out + j * cols;
