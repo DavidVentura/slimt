@@ -41,6 +41,8 @@ void add_positional_embedding(const float* word_embedding, const float* signal,
 
 void softmax(float* logits, size_t batch_size, size_t num_classes, float* out);
 
+size_t argmax(const float* x, size_t n);
+
 void batch_matrix_multiply(const float* A, const float* B, size_t batch_size,
                            size_t rows_a, size_t cols_a, size_t rows_b,
                            size_t cols_b, bool trans_a, bool trans_b,

@@ -310,22 +310,9 @@ Words greedy_sample(const Tensor &logits, const Vocabulary &vocabulary,
                     size_t batch_size) {
   Words sampled_words;
   size_t stride = vocabulary.size();
+  const auto *data = logits.data<float>();
   for (size_t i = 0; i < batch_size; i++) {
-    const auto *data = logits.data<float>();
-
-    // Initialize: 0
-    size_t cls = 0;
-    size_t max_index = cls;
-    float max_value = data[i * stride + cls];
-
-    for (cls = 1; cls < stride; cls++) {
-      float value = data[i * stride + cls];
-      if (value > max_value) {
-        max_index = cls;
-        max_value = value;
-      }
-    }
-
+    size_t max_index = argmax(data + i * stride, stride);
     sampled_words.push_back(max_index);
     if (false) {  // NOLINT
       constexpr size_t kValue = 5;
@@ -342,22 +329,9 @@ Words greedy_sample_from_words(const Tensor &logits,
   (void)vocabulary;
   size_t stride = words.size();
   Words sampled_words;
+  const auto *data = logits.data<float>();
   for (size_t i = 0; i < batch_size; i++) {
-    const auto *data = logits.data<float>();
-
-    // Initialize: 0
-    size_t cls = 0;
-    size_t max_index = cls;
-    float max_value = data[i * stride + cls];
-
-    for (cls = 1; cls < stride; cls++) {
-      float value = data[i * stride + cls];
-      if (value > max_value) {
-        max_index = cls;
-        max_value = value;
-      }
-    }
-
+    size_t max_index = argmax(data + i * stride, stride);
     sampled_words.push_back(words[max_index]);
     if (false) {  // NOLINT
       constexpr size_t kValue = 5;
