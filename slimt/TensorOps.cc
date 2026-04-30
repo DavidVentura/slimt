@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 
+#include "slimt/Simd.hh"
 #include "slimt/Tensor.hh"
 
 #ifdef SLIMT_HAS_BLAS

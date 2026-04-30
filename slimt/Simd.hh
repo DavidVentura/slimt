@@ -22,7 +22,7 @@ struct Ops;
 
 // Naive implementation
 
-#if defined(USE_AVX2) && defined(USE_FLOATOPS_SIMD)
+#if defined(USE_AVX2)
 #include "slimt/simd/avx2.h"
 #define VEXT_W8_AVAILABLE
 
