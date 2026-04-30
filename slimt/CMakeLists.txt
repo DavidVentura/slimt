@@ -39,6 +39,7 @@ set(SLIMT_PRIVATE_HEADERS
 set(SLIMT_SOURCES
     Aligned.cc
     Annotation.cc
+    Arena.cc
     Batcher.cc
     Frontend.cc
     HTML.cc

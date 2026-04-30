@@ -1,5 +1,6 @@
 #include "slimt/Modules.hh"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -277,7 +278,11 @@ Tensor SSRU::forward(Tensor &state, const Tensor &x) const {
   // h(t) = α LayerNorm(y(t) + x(t)) + β
   Tensor h = ln_.forward(x + y);
 
-  state = std::move(c_t);
+  // The recurrent state outlives the current decoder step; copy c_t's data
+  // into state's existing buffer instead of move-assigning a new one (which
+  // would adopt c_t's possibly-arena-backed memory).
+  std::copy(c_t.data<float>(), c_t.data<float>() + state.size(),
+            state.data<float>());
 
   return h;
 }

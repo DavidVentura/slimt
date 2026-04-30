@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "slimt/Aligned.hh"
+#include "slimt/Arena.hh"
 #include "slimt/Input.hh"
 #include "slimt/Io.hh"
 #include "slimt/Shortlist.hh"
@@ -213,19 +214,32 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   Tensor selected_mask;
 
   size_t decoder_rows = active_to_original.size();
-  auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask, states,
-                                     contexts, previous_slice, indices);
 
-  if (indices) {
-    previous_slice =
-        greedy_sample_from_words(logits, vocabulary_, *indices, batch_size);
-  } else {
-    previous_slice = greedy_sample(logits, vocabulary_, batch_size);
+  // Per-step transient tensors (Q/K/V projections, attention scores, FFN
+  // intermediates, returned logits/attn) come from this arena; allocations
+  // that must outlive the step (states, contexts, encoder_out, select_batch
+  // outputs from compact) happen outside arena scopes.
+  constexpr size_t kArenaInitialBytes = 8 << 20;  // 8 MiB
+  Arena arena(kArenaInitialBytes);
+
+  size_t remaining;
+  {
+    ArenaScope arena_scope(arena);
+    auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
+                                       states, contexts, previous_slice,
+                                       indices);
+
+    if (indices) {
+      previous_slice = greedy_sample_from_words(logits, vocabulary_, *indices,
+                                                batch_size);
+    } else {
+      previous_slice = greedy_sample(logits, vocabulary_, batch_size);
+    }
+
+    update_alignment(active_to_original, input.lengths(), complete, attn,
+                     alignments);
+    remaining = record(active_to_original, previous_slice, sentences);
   }
-
-  update_alignment(active_to_original, input.lengths(), complete, attn,
-                   alignments);
-  size_t remaining = record(active_to_original, previous_slice, sentences);
 
   auto compact = [&]() {
     std::vector<size_t> keep;
@@ -268,21 +282,26 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   size_t max_seq_length = input.limit_factor() * source_sequence_length;
   size_t steps = 1;
   for (size_t i = 1; i < max_seq_length && remaining > 0; i++) {
+    arena.reset();
     decoder_rows += active_to_original.size();
-    auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask, states,
-                                       contexts, previous_slice, indices);
-    steps++;
-    if (indices) {
-      previous_slice =
-          greedy_sample_from_words(logits, vocabulary_, *indices,
-                                   active_to_original.size());
-    } else {
-      previous_slice =
-          greedy_sample(logits, vocabulary_, active_to_original.size());
+    {
+      ArenaScope arena_scope(arena);
+      auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
+                                         states, contexts, previous_slice,
+                                         indices);
+      steps++;
+      if (indices) {
+        previous_slice =
+            greedy_sample_from_words(logits, vocabulary_, *indices,
+                                     active_to_original.size());
+      } else {
+        previous_slice =
+            greedy_sample(logits, vocabulary_, active_to_original.size());
+      }
+      update_alignment(active_to_original, input.lengths(), complete, attn,
+                       alignments);
+      remaining = record(active_to_original, previous_slice, sentences);
     }
-    update_alignment(active_to_original, input.lengths(), complete, attn,
-                     alignments);
-    remaining = record(active_to_original, previous_slice, sentences);
     compact();
   }
 
