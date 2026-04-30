@@ -282,16 +282,12 @@ void add_positional_embedding(const float* word_embedding,
 
 void softmax(float* logits, size_t batch_size, size_t num_classes, float* out) {
 #ifdef VEXT_W8_AVAILABLE
-  if (num_classes % VDatum<VExt::w8>::kWidth == 0) {
-    vext::softmax<VExt::w8>(logits, batch_size, num_classes, out);
-    return;
-  }
+  vext::softmax<VExt::w8>(logits, batch_size, num_classes, out);
+  return;
 #endif
 #ifdef VEXT_W4_AVAILABLE
-  if (num_classes % VDatum<VExt::w4>::kWidth == 0) {
-    vext::softmax<VExt::w4>(logits, batch_size, num_classes, out);
-    return;
-  }
+  vext::softmax<VExt::w4>(logits, batch_size, num_classes, out);
+  return;
 #endif
 
   for (size_t i = 0; i < batch_size; i++) {

@@ -161,46 +161,65 @@ void layer_norm(const float* in, const float* scale, const float* bias,
 }
 
 template <VExt Width>
-void softmax(const float* _logits, size_t batch_size, size_t num_classes,
-             float* _out) {
+void softmax(const float* logits_in, size_t batch_size, size_t num_classes,
+             float* out_in) {
+  // Attention softmax operates over variable-length sequences, so per-row
+  // pointers are not 32-byte aligned in general — use unaligned load/store
+  // and a scalar tail.
   using Element = VDatum<Width>;
-  const auto* logits = reinterpret_cast<const Element*>(_logits);
-  auto* out = reinterpret_cast<Element*>(_out);
-  int rows = batch_size;
-  int cols = num_classes / Element::kWidth;  // operating with fewer columns.
+  using Scalar = typename Ops<Width>::Scalar;
+  constexpr size_t kWidth = Element::kWidth;
+  size_t aligned = (num_classes / kWidth) * kWidth;
 
-  for (int j = 0; j < rows; ++j) {
-    // p is probability, which is computed from logits.
-    Element* p = out + j * cols;
-    const Element* logit = logits + j * cols;
+  for (size_t j = 0; j < batch_size; ++j) {
+    const float* logit = logits_in + j * num_classes;
+    float* p = out_in + j * num_classes;
 
-    // Compute maximum.
-    Element max_value = logit[0];
-    for (int i = 1; i < cols; ++i) {
-      max_value = Ops<Width>::max(max_value, logit[i]);
+    // Pass 1: max.
+    Scalar max_scalar;
+    if (aligned > 0) {
+      Element vmax = Ops<Width>::loadu(logit);
+      for (size_t i = kWidth; i < aligned; i += kWidth) {
+        vmax = Ops<Width>::max(vmax, Ops<Width>::loadu(logit + i));
+      }
+      max_scalar = Ops<Width>::Reduce::max(vmax);
+      for (size_t i = aligned; i < num_classes; ++i) {
+        max_scalar = std::max(max_scalar, logit[i]);
+      }
+    } else {
+      max_scalar = logit[0];
+      for (size_t i = 1; i < num_classes; ++i) {
+        max_scalar = std::max(max_scalar, logit[i]);
+      }
+    }
+    Element vmax_broadcast(max_scalar);
+
+    // Pass 2: shift by max, exp, accumulate sum, store exp values.
+    Scalar sum_scalar = 0.0F;
+    if (aligned > 0) {
+      Element vsum(0.0F);
+      for (size_t i = 0; i < aligned; i += kWidth) {
+        Element x = Ops<Width>::loadu(logit + i);
+        Element e = Ops<Width>::exp(Ops<Width>::sub(x, vmax_broadcast));
+        vsum = Ops<Width>::add(vsum, e);
+        Ops<Width>::storeu(p + i, e);
+      }
+      sum_scalar = Ops<Width>::Reduce::sum(vsum);
+    }
+    for (size_t i = aligned; i < num_classes; ++i) {
+      Scalar e = std::exp(logit[i] - max_scalar);
+      p[i] = e;
+      sum_scalar += e;
     }
 
-    // if ElementType is a complex type, e.g. float32x8, find the max of
-    // these 8 values
-    typename Ops<Width>::Scalar max_value_scalar =
-        Ops<Width>::Reduce::max(max_value);
-    Element max_value_projected(max_value_scalar);
-
-    // Find numerically stable sumexp, after shifting values by maximum.
-    Element vsum(0.0F);
-    for (int i = 0; i < cols; ++i) {
-      Element shifted = Ops<Width>::sub(logit[i], max_value_projected);
-      Element exp_x = Ops<Width>::exp(shifted);
-      vsum = Ops<Width>::add(vsum, exp_x);
-      p[i] = exp_x;
+    // Pass 3: normalize.
+    Element vsum_broadcast(sum_scalar);
+    for (size_t i = 0; i < aligned; i += kWidth) {
+      Element e = Ops<Width>::loadu(p + i);
+      Ops<Width>::storeu(p + i, Ops<Width>::div(e, vsum_broadcast));
     }
-
-    // if Register is a complex type, e.g. float32x8, sum these 8 values
-    typename Ops<Width>::Scalar sums = Ops<Width>::Reduce::sum(vsum);
-    Element sums_value_projected(sums);
-
-    for (int i = 0; i < cols; ++i) {
-      p[i] = Ops<Width>::div(p[i], sums_value_projected);
+    for (size_t i = aligned; i < num_classes; ++i) {
+      p[i] /= sum_scalar;
     }
   }
 }
