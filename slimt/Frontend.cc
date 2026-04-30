@@ -205,7 +205,8 @@ std::vector<Response> Blocking::pivot(const Ptr<Model> &first,
 }
 
 Async::Async(const Config &config)
-    : cache_(make_cache(config.cache_size)),
+    : config_(config),
+      cache_(make_cache(config.cache_size)),
       batcher_(config.max_words, config.wrap_length,
                config.tgt_length_limit_factor) {
   // Also creates consumers, starts listening.
