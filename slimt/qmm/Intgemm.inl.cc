@@ -5,14 +5,43 @@
 
 namespace slimt::qmm::detail {
 template <>
-Tensor affine_with_select<Provider::Intgemm>(
-    const Tensor& x, const Tensor& W, const Tensor& b, float a_quant,
-    float b_quant, const std::vector<uint32_t>& indices,
+Tensor prepare_bias<Provider::Intgemm>(const Tensor& W, const Tensor& b,
+                                       float a_quant, float b_quant,
+                                       const std::string& name) {
+  const Tensor& B = W;     // NOLINT
+  const Tensor& bias = b;  // NOLINT
+
+  size_t B_cols = B.dim(-1);          // NOLINT
+  size_t B_rows = B.size() / B_cols;  // NOLINT
+
+  Tensor prepared_bias(Type::f32, bias.shape(),
+                       (name.empty() ? "prepared_bias" : name));
+  float a_alpha = kInt8Maxf / a_quant;
+  float b_alpha = kInt8Maxf / b_quant;
+
+  float bias_unquant_multiplier = (-1.0F * (a_alpha * b_alpha)) / kInt8Maxf;
+  auto prepare_bias_callback = intgemm::callbacks::UnquantizeAndAddBiasAndWrite(
+      bias_unquant_multiplier, bias.data<float>(),  //
+      prepared_bias.data<float>()                   //
+  );
+
+  intgemm::Int8Shift::PrepareBias(  //
+      B.data<int8_t>(),             //
+      B_rows, B_cols,               //
+      prepare_bias_callback         //
+  );
+
+  return prepared_bias;
+}
+
+template <>
+Tensor affine_with_select_prepared_bias<Provider::Intgemm>(
+    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
+    float a_quant, float b_quant, const std::vector<uint32_t>& indices,
     const std::string& name) {
   // Naming is to simplify thinking with the intgemm API below.
   const Tensor& A = x;  // NOLINT
   const Tensor& B = W;  // NOLINT
-  const Tensor& bias = b;
 
   size_t A_cols = A.dim(-1);          // NOLINT
   size_t B_cols = B.dim(-1);          // NOLINT
@@ -31,24 +60,6 @@ Tensor affine_with_select<Provider::Intgemm>(
       A.data<float>(), prepared_A.data<int8_t>(),            //
       a_quant,                                               //
       A_rows, width                                          //
-  );
-
-  // Prepare bias
-  Tensor prepared_bias(Type::f32, bias.shape(), "prepared_bias");
-  constexpr float kMax8bit = kInt8Maxf;
-  float a_alpha = kMax8bit / a_quant;
-  float b_alpha = kMax8bit / b_quant;
-
-  float bias_unquant_multiplier = (-1.0F * (a_alpha * b_alpha)) / kMax8bit;
-  auto prepare_bias_callback = intgemm::callbacks::UnquantizeAndAddBiasAndWrite(
-      bias_unquant_multiplier, bias.data<float>(),  //
-      prepared_bias.data<float>()                   //
-  );
-
-  intgemm::Int8Shift::PrepareBias(  //
-      B.data<int8_t>(),             //
-      width, B_cols,                //
-      prepare_bias_callback         //
   );
 
   // Select before multiply?
@@ -90,13 +101,23 @@ Tensor affine_with_select<Provider::Intgemm>(
 }
 
 template <>
-Tensor affine<Provider::Intgemm>(const Tensor& x, const Tensor& W,
-                                 const Tensor& b, float a_quant, float b_quant,
-                                 const std::string& name) {
+Tensor affine_with_select<Provider::Intgemm>(
+    const Tensor& x, const Tensor& W, const Tensor& b, float a_quant,
+    float b_quant, const std::vector<uint32_t>& indices,
+    const std::string& name) {
+  Tensor prepared_bias =
+      prepare_bias<Provider::Intgemm>(W, b, a_quant, b_quant, "prepared_bias");
+  return affine_with_select_prepared_bias<Provider::Intgemm>(
+      x, W, prepared_bias, a_quant, b_quant, indices, name);
+}
+
+template <>
+Tensor affine_with_prepared_bias<Provider::Intgemm>(
+    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
+    float a_quant, float b_quant, const std::string& name) {
   // Naming is to simplify thinking with the intgemm API below.
   const Tensor& A = x;  // NOLINT
   const Tensor& B = W;  // NOLINT
-  const Tensor& bias = b;
 
   size_t A_cols = A.dim(-1);          // NOLINT
   size_t B_cols = B.dim(-1);          // NOLINT
@@ -118,23 +139,6 @@ Tensor affine<Provider::Intgemm>(const Tensor& x, const Tensor& W,
       A_rows, width                                          //
   );
 
-  // Prepare bias
-  Tensor prepared_bias(Type::f32, bias.shape(), "prepared_bias");
-  float a_alpha = kInt8Maxf / a_quant;
-  float b_alpha = kInt8Maxf / b_quant;
-
-  float bias_unquant_multiplier = (-1.0F * (a_alpha * b_alpha)) / kInt8Maxf;
-  auto prepare_bias_callback = intgemm::callbacks::UnquantizeAndAddBiasAndWrite(
-      bias_unquant_multiplier, bias.data<float>(),  //
-      prepared_bias.data<float>()                   //
-  );
-
-  intgemm::Int8Shift::PrepareBias(  //
-      B.data<int8_t>(),             //
-      width, B_cols,                //
-      prepare_bias_callback         //
-  );
-
   // Multiply y = A * B + bias (affine)
   // Set y's shape replacing last dimension with the feature-dim B is projecting
   // onto (B_cols).
@@ -153,6 +157,16 @@ Tensor affine<Provider::Intgemm>(const Tensor& x, const Tensor& W,
   );
 
   return y;
+}
+
+template <>
+Tensor affine<Provider::Intgemm>(const Tensor& x, const Tensor& W,
+                                 const Tensor& b, float a_quant, float b_quant,
+                                 const std::string& name) {
+  Tensor prepared_bias =
+      prepare_bias<Provider::Intgemm>(W, b, a_quant, b_quant, "prepared_bias");
+  return affine_with_prepared_bias<Provider::Intgemm>(
+      x, W, prepared_bias, a_quant, b_quant, name);
 }
 
 template <>

@@ -3,7 +3,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -81,28 +85,79 @@ std::optional<ShortlistGenerator> Model::make_shortlist_generator(
 }
 
 namespace {
-void update_alignment(const std::vector<size_t> &lengths,
+Tensor select_batch(const Tensor &tensor, const std::vector<size_t> &indices,
+                    const std::string &name) {
+  Shape shape = tensor.shape();
+  shape.set_dim(0, indices.size());
+  Tensor selected(tensor.type(), shape, name);
+
+  if (indices.empty()) {
+    return selected;
+  }
+
+  size_t batch_size = tensor.dim(0);
+  size_t bytes_per_entry =
+      size_in_bytes(tensor.type()) * tensor.size() / batch_size;
+  const char *source = tensor.data<char>();
+  char *target = selected.data<char>();
+  for (size_t i = 0; i < indices.size(); ++i) {
+    size_t index = indices[i];
+    std::memcpy(target + i * bytes_per_entry, source + index * bytes_per_entry,
+                bytes_per_entry);
+  }
+
+  return selected;
+}
+
+std::vector<Tensor> select_batch(const std::vector<Tensor> &tensors,
+                                 const std::vector<size_t> &indices) {
+  std::vector<Tensor> selected;
+  selected.reserve(tensors.size());
+  for (const Tensor &tensor : tensors) {
+    selected.push_back(select_batch(tensor, indices, tensor.name()));
+  }
+  return selected;
+}
+
+AttentionContext select_batch(const AttentionContext &context,
+                              const std::vector<size_t> &indices) {
+  return {
+      .keys = select_batch(context.keys, indices, context.keys.name()),
+      .values = select_batch(context.values, indices, context.values.name()),
+  };
+}
+
+std::vector<AttentionContext> select_batch(
+    const std::vector<AttentionContext> &contexts,
+    const std::vector<size_t> &indices) {
+  std::vector<AttentionContext> selected;
+  selected.reserve(contexts.size());
+  for (const AttentionContext &context : contexts) {
+    selected.push_back(select_batch(context, indices));
+  }
+  return selected;
+}
+
+void update_alignment(const std::vector<size_t> &active_to_original,
+                      const std::vector<size_t> &lengths,
                       const std::vector<bool> &finished, const Tensor &attn,
                       Alignments &alignments) {
   const auto *data = attn.data<float>();
-  // B x H x 1 (T) x S
   size_t batch_size = attn.dim(-4);
   size_t num_heads = attn.dim(-3);
   size_t slice = attn.dim(-2);
   size_t source_length = attn.dim(-1);
 
-  // https://github.com/marian-nmt/marian-dev/blob/53b0b0d7c83e71265fee0dd832ab3bcb389c6ec3/src/models/transformer.h#L214-L232
   for (size_t id = 0; id < batch_size; id++) {
-    // Copy the elements into the particular alignment index.
-    size_t head_id = 0;
-    if (!finished[id]) {
+    size_t original_id = active_to_original[id];
+    if (!finished[original_id]) {
       size_t batch_stride = (num_heads * slice * source_length);
       size_t head_stride = (slice * source_length);
-      const float *alignment = data + id * batch_stride + head_id * head_stride;
-      size_t length = lengths[id];
+      const float *alignment = data + id * batch_stride + head_stride * 0;
+      size_t length = lengths[original_id];
       Distribution distribution(length);
       std::copy(alignment, alignment + length, distribution.data());
-      alignments[id].push_back(std::move(distribution));
+      alignments[original_id].push_back(std::move(distribution));
     }
   }
 }
@@ -124,14 +179,18 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
 
   std::vector<bool> complete(batch_size, false);
   uint32_t eos = vocabulary_.eos_id();
-  auto record = [eos, &complete](Words &step, Sentences &sentences) {
+  auto record = [eos, &complete](const std::vector<size_t> &active_to_original,
+                                 Words &step, Sentences &sentences) {
     size_t finished = 0;
     for (size_t i = 0; i < step.size(); i++) {
-      if (not complete[i]) {
-        complete[i] = (step[i] == eos);
-        sentences[i].push_back(step[i]);
+      size_t original_id = active_to_original[i];
+      if (not complete[original_id]) {
+        complete[original_id] = (step[i] == eos);
+        sentences[original_id].push_back(step[i]);
       }
-      finished += static_cast<int>(complete[i]);
+    }
+    for (bool done : complete) {
+      finished += static_cast<int>(done);
     }
     return sentences.size() - finished;
   };
@@ -141,10 +200,21 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   Alignments alignments(sentences.size());
 
   const Decoder &decoder = transformer_.decoder();
+  std::vector<size_t> active_to_original(batch_size);
+  std::iota(active_to_original.begin(), active_to_original.end(), 0);
+
   Words previous_slice = {};
   std::vector<Tensor> states = decoder.start_states(batch_size);
-  auto [logits, attn] =
-      decoder.step(encoder_out, input.mask(), states, previous_slice, indices);
+  std::vector<AttentionContext> contexts = decoder.prepare_contexts(encoder_out);
+
+  const Tensor *active_encoder_out = &encoder_out;
+  const Tensor *active_mask = &input.mask();
+  Tensor selected_encoder_out;
+  Tensor selected_mask;
+
+  size_t decoder_rows = active_to_original.size();
+  auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask, states,
+                                     contexts, previous_slice, indices);
 
   if (indices) {
     previous_slice =
@@ -153,22 +223,82 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
     previous_slice = greedy_sample(logits, vocabulary_, batch_size);
   }
 
-  update_alignment(input.lengths(), complete, attn, alignments);
-  record(previous_slice, sentences);
+  update_alignment(active_to_original, input.lengths(), complete, attn,
+                   alignments);
+  size_t remaining = record(active_to_original, previous_slice, sentences);
 
-  size_t remaining = sentences.size();
+  auto compact = [&]() {
+    std::vector<size_t> keep;
+    std::vector<size_t> next_active_to_original;
+    Words next_previous_slice;
+    keep.reserve(active_to_original.size());
+    next_active_to_original.reserve(active_to_original.size());
+    next_previous_slice.reserve(active_to_original.size());
+
+    for (size_t i = 0; i < active_to_original.size(); ++i) {
+      size_t original_id = active_to_original[i];
+      if (!complete[original_id]) {
+        keep.push_back(i);
+        next_active_to_original.push_back(original_id);
+        next_previous_slice.push_back(previous_slice[i]);
+      }
+    }
+
+    previous_slice = std::move(next_previous_slice);
+    if (keep.empty()) {
+      active_to_original.clear();
+      return;
+    }
+    if (keep.size() == active_to_original.size()) {
+      active_to_original = std::move(next_active_to_original);
+      return;
+    }
+
+    selected_encoder_out =
+        select_batch(*active_encoder_out, keep, active_encoder_out->name());
+    selected_mask = select_batch(*active_mask, keep, active_mask->name());
+    active_encoder_out = &selected_encoder_out;
+    active_mask = &selected_mask;
+    states = select_batch(states, keep);
+    contexts = select_batch(contexts, keep);
+    active_to_original = std::move(next_active_to_original);
+  };
+  compact();
+
   size_t max_seq_length = input.limit_factor() * source_sequence_length;
+  size_t steps = 1;
   for (size_t i = 1; i < max_seq_length && remaining > 0; i++) {
-    auto [logits, attn] = decoder.step(encoder_out, input.mask(), states,
-                                       previous_slice, indices);
+    decoder_rows += active_to_original.size();
+    auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask, states,
+                                       contexts, previous_slice, indices);
+    steps++;
     if (indices) {
       previous_slice =
-          greedy_sample_from_words(logits, vocabulary_, *indices, batch_size);
+          greedy_sample_from_words(logits, vocabulary_, *indices,
+                                   active_to_original.size());
     } else {
-      previous_slice = greedy_sample(logits, vocabulary_, batch_size);
+      previous_slice =
+          greedy_sample(logits, vocabulary_, active_to_original.size());
     }
-    update_alignment(input.lengths(), complete, attn, alignments);
-    remaining = record(previous_slice, sentences);
+    update_alignment(active_to_original, input.lengths(), complete, attn,
+                     alignments);
+    remaining = record(active_to_original, previous_slice, sentences);
+    compact();
+  }
+
+  if (std::getenv("SLIMT_DECODE_STATS") != nullptr) {
+    size_t target_tokens = 0;
+    for (const auto &sentence : sentences) {
+      target_tokens += sentence.size();
+    }
+    size_t wasted_rows =
+        decoder_rows > target_tokens ? decoder_rows - target_tokens : 0;
+    std::fprintf(stderr,
+                 "[decode-stats] batch=%zu src_len=%zu steps=%zu rows=%zu "
+                 "target_tokens=%zu wasted_rows=%zu limit=%zu shortlist=%d\n",
+                 batch_size, source_sequence_length, steps, decoder_rows,
+                 target_tokens, wasted_rows, max_seq_length,
+                 indices.has_value() ? 1 : 0);
   }
 
   Histories histories;

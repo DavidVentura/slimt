@@ -17,6 +17,7 @@ class Encoder {
   explicit Encoder(size_t layers, size_t num_heads, size_t feed_forward_depth);
   Tensor forward(const Tensor &embedding, const Tensor &mask) const;
   void register_parameters(const std::string &prefix, ParameterMap &parameters);
+  void prepare_biases();
   const std::vector<EncoderLayer> &encoder() const { return encoder_; }
 
  private:
@@ -29,10 +30,14 @@ class Decoder {
           const Tensor &embedding);
 
   void register_parameters(const std::string &prefix, ParameterMap &parameters);
+  void prepare_biases();
 
+  std::vector<AttentionContext> prepare_contexts(
+      const Tensor &encoder_out) const;
   std::vector<Tensor> start_states(size_t batch_size) const;
   std::tuple<Tensor, Tensor> step(const Tensor &encoder_out, const Tensor &mask,
                                   std::vector<Tensor> &states,
+                                  const std::vector<AttentionContext> &contexts,
                                   const Words &previous_step,
                                   const std::optional<Words> &shortlist) const;
 
@@ -64,6 +69,7 @@ class Transformer {
  private:
   void register_parameters(const std::string &prefix, ParameterMap &parameters);
   void load_parameters();
+  void prepare_biases();
 
   std::vector<io::Item> items_;
   Tensor embedding_;

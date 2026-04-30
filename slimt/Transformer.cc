@@ -75,6 +75,12 @@ void Encoder::register_parameters(const std::string &prefix,
   }
 }
 
+void Encoder::prepare_biases() {
+  for (EncoderLayer &layer : encoder_) {
+    layer.prepare_biases();
+  }
+}
+
 std::vector<Tensor> Decoder::start_states(size_t batch_size) const {
   std::vector<Tensor> states;
   for (const auto &layer : decoder_) {
@@ -84,6 +90,16 @@ std::vector<Tensor> Decoder::start_states(size_t batch_size) const {
   return states;
 }
 
+std::vector<AttentionContext> Decoder::prepare_contexts(
+    const Tensor &encoder_out) const {
+  std::vector<AttentionContext> contexts;
+  contexts.reserve(decoder_.size());
+  for (const auto &layer : decoder_) {
+    contexts.push_back(layer.prepare_context(encoder_out));
+  }
+  return contexts;
+}
+
 Transformer::Transformer(size_t encoder_layers, size_t decoder_layers,
                          size_t num_heads, size_t feed_forward_depth,
                          View model)
@@ -91,6 +107,7 @@ Transformer::Transformer(size_t encoder_layers, size_t decoder_layers,
       encoder_(encoder_layers, num_heads, feed_forward_depth),  //
       decoder_(decoder_layers, num_heads, feed_forward_depth, embedding_) {
   load_parameters();
+  prepare_biases();
 }
 
 Decoder::Decoder(size_t layers, size_t num_heads, size_t feed_forward_depth,
@@ -117,8 +134,16 @@ void Decoder::register_parameters(const std::string &prefix,
   }
 }
 
+void Decoder::prepare_biases() {
+  prepare_bias(output_);
+  for (DecoderLayer &layer : decoder_) {
+    layer.prepare_biases();
+  }
+}
+
 std::tuple<Tensor, Tensor> Decoder::step(
     const Tensor &encoder_out, const Tensor &mask, std::vector<Tensor> &states,
+    const std::vector<AttentionContext> &contexts,
     const Words &previous_step, const std::optional<Words> &shortlist) const {
   // Infer batch-size from encoder_out.
   size_t encoder_feature_dim = encoder_out.dim(-1);
@@ -160,11 +185,11 @@ std::tuple<Tensor, Tensor> Decoder::step(
   transform_embedding(decoder_embed);
 
   auto [x, attn] =
-      decoder_[0].forward(encoder_out, mask, states[0], decoder_embed);
+      decoder_[0].forward(contexts[0], mask, states[0], decoder_embed);
 
   Tensor guided_alignment = std::move(attn);
   for (size_t i = 1; i < decoder_.size(); i++) {
-    auto [y, _attn] = decoder_[i].forward(encoder_out, mask, states[i], x);
+    auto [y, _attn] = decoder_[i].forward(contexts[i], mask, states[i], x);
     x = std::move(y);
     if (i + 1 == decoder_.size()) {
       // Last decoder layer
@@ -229,6 +254,11 @@ void Transformer::register_parameters(const std::string &prefix,
   parameters.emplace("Wemb", &embedding_);
   encoder_.register_parameters(prefix, parameters);
   decoder_.register_parameters(prefix, parameters);
+}
+
+void Transformer::prepare_biases() {
+  encoder_.prepare_biases();
+  decoder_.prepare_biases();
 }
 
 namespace {

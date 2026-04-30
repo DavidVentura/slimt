@@ -21,6 +21,24 @@ float retrieve_quantization_multiplier(const Tensor &W) {
   return b_quant;
 }
 
+const Tensor &retrieve_prepared_bias(const Affine &parameters) {
+  assert(parameters.prepared_bias_ready);
+  return parameters.prepared_bias;
+}
+
+void prepare_bias(Affine &parameters) {
+  float a_quant = parameters.quant.item<float>();
+  float b_quant = retrieve_quantization_multiplier(parameters.W);
+  parameters.prepared_bias = qmm::prepare_bias(  //
+      parameters.W, parameters.b,                //
+      a_quant, b_quant,                          //
+      "prepared_bias"                            //
+  );
+  parameters.prepared_bias_a_quant = a_quant;
+  parameters.prepared_bias_b_quant = b_quant;
+  parameters.prepared_bias_ready = true;
+}
+
 std::tuple<Tensor, Tensor> scaled_dot_product_attention(const Tensor &q,
                                                         const Tensor &k,
                                                         const Tensor &v,
@@ -144,9 +162,24 @@ Tensor join_heads(const Tensor &x) {
 
 Tensor affine(const Affine &parameters, const Tensor &x,
               const std::string &name /* = ""*/) {
-  Tensor y = qmm::affine(                              //
+  Tensor local_prepared_bias;
+  const Tensor *prepared_bias = nullptr;
+  if (parameters.prepared_bias_ready) {
+    prepared_bias = &retrieve_prepared_bias(parameters);
+  } else {
+    local_prepared_bias = qmm::prepare_bias(             //
+        parameters.W, parameters.b,                      //
+        parameters.quant.item<float>(),                  //
+        retrieve_quantization_multiplier(parameters.W),  //
+        "prepared_bias"                                  //
+    );
+    prepared_bias = &local_prepared_bias;
+  }
+
+  Tensor y = qmm::affine_with_prepared_bias(           //
       x,                                               //
-      parameters.W, parameters.b,                      //
+      parameters.W,                                    //
+      *prepared_bias,                                  //
       parameters.quant.item<float>(),                  //
       retrieve_quantization_multiplier(parameters.W),  //
       name                                             //
@@ -157,9 +190,24 @@ Tensor affine(const Affine &parameters, const Tensor &x,
 Tensor affine_with_select(const Affine &parameters, const Tensor &x,
                           const std::vector<uint32_t> &indices,
                           const std::string &name /*= ""*/) {
-  Tensor y = qmm::affine_with_select(                  //
+  Tensor local_prepared_bias;
+  const Tensor *prepared_bias = nullptr;
+  if (parameters.prepared_bias_ready) {
+    prepared_bias = &retrieve_prepared_bias(parameters);
+  } else {
+    local_prepared_bias = qmm::prepare_bias(             //
+        parameters.W, parameters.b,                      //
+        parameters.quant.item<float>(),                  //
+        retrieve_quantization_multiplier(parameters.W),  //
+        "prepared_bias"                                  //
+    );
+    prepared_bias = &local_prepared_bias;
+  }
+
+  Tensor y = qmm::affine_with_select_prepared_bias(    //
       x,                                               //
-      parameters.W, parameters.b,                      //
+      parameters.W,                                    //
+      *prepared_bias,                                  //
       parameters.quant.item<float>(),                  //
       retrieve_quantization_multiplier(parameters.W),  //
       indices,                                         //
@@ -238,15 +286,21 @@ std::tuple<Tensor, Tensor> DecoderLayer::forward(const Tensor &encoder_out,
                                                  const Tensor &mask,
                                                  Tensor &state,
                                                  const Tensor &x) const {
+  AttentionContext context = prepare_context(encoder_out);
+  return forward(context, mask, state, x);
+}
+
+AttentionContext DecoderLayer::prepare_context(
+    const Tensor &encoder_out) const {
+  return attention_.prepare_context(encoder_out, encoder_out);
+}
+
+std::tuple<Tensor, Tensor> DecoderLayer::forward(
+    const AttentionContext &context, const Tensor &mask, Tensor &state,
+    const Tensor &x) const {
   Tensor decoder_out = rnn_.forward(state, x);
 
-  // Assign query, key, value for cross-attention.
-  const Tensor &q = decoder_out;
-  const Tensor &k = encoder_out;
-  const Tensor &v = encoder_out;
-
-  // TODO(@jerinphilip), this will be called over and over.
-  auto [out, attn] = attention_.forward(q, k, v, mask);
+  auto [out, attn] = attention_.forward(decoder_out, context, mask);
 
   Tensor ffn1_out = ffn_[0].forward(out);
   Tensor ffn1_acts = relu(ffn1_out);
@@ -274,9 +328,35 @@ DecoderLayer::DecoderLayer(size_t depth, size_t ffn_count, size_t num_heads)
 
 FFN::FFN(size_t depth) : depth_(depth) {}
 
+void FFN::prepare_biases() { prepare_bias(O_); }
+
 Tensor FFN::forward(const Tensor &x) const {
   Tensor y = affine(O_, x, "ffn" + std::to_string(depth_));
   return y;
+}
+
+void Attention::prepare_biases() {
+  prepare_bias(Q_);
+  prepare_bias(K_);
+  prepare_bias(V_);
+  prepare_bias(O_);
+}
+
+void SSRU::prepare_biases() { prepare_bias(F_); }
+
+void EncoderLayer::prepare_biases() {
+  attention_.prepare_biases();
+  for (FFN &ffn : ffn_) {
+    ffn.prepare_biases();
+  }
+}
+
+void DecoderLayer::prepare_biases() {
+  attention_.prepare_biases();
+  rnn_.prepare_biases();
+  for (FFN &ffn : ffn_) {
+    ffn.prepare_biases();
+  }
 }
 
 Tensor LayerNorm::forward(const Tensor &x) const {
@@ -287,19 +367,31 @@ Tensor LayerNorm::forward(const Tensor &x) const {
 std::tuple<Tensor, Tensor> Attention::forward(const Tensor &q, const Tensor &k,
                                               const Tensor &v,
                                               const Tensor &mask) const {
+  AttentionContext context = prepare_context(k, v);
+  return forward(q, context, mask);
+}
+
+AttentionContext Attention::prepare_context(const Tensor &k,
+                                            const Tensor &v) const {
   // We have a B x T x H sequence coming in, for q, k and v.
-  Tensor yq = affine(Q_, q, "q");
   Tensor yk = affine(K_, k, "k");
   Tensor yv = affine(V_, v, "v");
 
-  // Split heads for query, keys and values.
+  return {
+      .keys = split_heads(yk, num_heads_),
+      .values = split_heads(yv, num_heads_),
+  };
+}
+
+std::tuple<Tensor, Tensor> Attention::forward(
+    const Tensor &q, const AttentionContext &context,
+    const Tensor &mask) const {
+  Tensor yq = affine(Q_, q, "q");
   Tensor split_yq = split_heads(yq, num_heads_);
-  Tensor split_yk = split_heads(yk, num_heads_);
-  Tensor split_yv = split_heads(yv, num_heads_);
 
   // Apply individual scaled-dot-product-attention (SDPA)
-  auto [attn_out, attn] =
-      scaled_dot_product_attention(split_yq, split_yk, split_yv, mask);
+  auto [attn_out, attn] = scaled_dot_product_attention(
+      split_yq, context.keys, context.values, mask);
 
   // Join heads.
   Tensor out = join_heads(attn_out);

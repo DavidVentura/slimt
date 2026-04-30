@@ -26,10 +26,26 @@ Tensor affine(const Tensor& x, const Tensor& W, const Tensor& b, float a_quant,
               float b_quant, const std::string& name = "");
 
 template <enum Provider>
+Tensor prepare_bias(const Tensor& W, const Tensor& b, float a_quant,
+                    float b_quant, const std::string& name = "");
+
+template <enum Provider>
+Tensor affine_with_prepared_bias(const Tensor& x, const Tensor& W,
+                                 const Tensor& prepared_bias, float a_quant,
+                                 float b_quant,
+                                 const std::string& name = "");
+
+template <enum Provider>
 Tensor affine_with_select(const Tensor& x, const Tensor& W, const Tensor& b,
                           float a_quant, float b_quant,
                           const std::vector<uint32_t>& indices,
                           const std::string& name = "");
+
+template <enum Provider>
+Tensor affine_with_select_prepared_bias(
+    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
+    float a_quant, float b_quant, const std::vector<uint32_t>& indices,
+    const std::string& name = "");
 
 template <enum Provider>
 Tensor dot(const Tensor& x, const Tensor& W, float a_quant, float b_quant,
@@ -48,10 +64,23 @@ void prepare_weight_quantized_transposed(const int8_t* input, int8_t* output,
 Tensor affine(const Tensor& x, const Tensor& W, const Tensor& b, float a_quant,
               float b_quant, const std::string& name = "");
 
+Tensor prepare_bias(const Tensor& W, const Tensor& b, float a_quant,
+                    float b_quant, const std::string& name = "");
+
+Tensor affine_with_prepared_bias(const Tensor& x, const Tensor& W,
+                                 const Tensor& prepared_bias, float a_quant,
+                                 float b_quant,
+                                 const std::string& name = "");
+
 Tensor affine_with_select(const Tensor& x, const Tensor& W, const Tensor& b,
                           float a_quant, float b_quant,
                           const std::vector<uint32_t>& indices,
                           const std::string& name = "");
+
+Tensor affine_with_select_prepared_bias(
+    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
+    float a_quant, float b_quant, const std::vector<uint32_t>& indices,
+    const std::string& name = "");
 
 Tensor dot(const Tensor& x, const Tensor& W, float a_quant, float b_quant,
            const std::string& name = "");

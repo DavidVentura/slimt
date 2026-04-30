@@ -32,7 +32,7 @@ struct SLIMT_EXPORT Config {
     // clang-format off
     app.add_option("--limit-tgt", tgt_length_limit_factor, "Max length proportional to source target can have.");
     app.add_option("--max-words", max_words, "Maximum words in a batch.");
-    app.add_option("--wrap-length", max_words, "Maximum length allowed for a sample, beyond which hard-wrap.");
+    app.add_option("--wrap-length", wrap_length, "Maximum length allowed for a sample, beyond which hard-wrap.");
     app.add_option("--workers", workers, "Number of workers threads to launch for translating.");
     // clang-format on
   }
