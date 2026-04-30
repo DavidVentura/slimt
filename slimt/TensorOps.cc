@@ -777,6 +777,19 @@ Tensor highway(const Tensor& x, const Tensor& y, const Tensor& g) {
   auto* out = c_t.data<float>();
   size_t size = x.size();
 
+#ifdef VEXT_W8_AVAILABLE
+  if (size % VDatum<VExt::w8>::kWidth == 0) {
+    vext::highway<VExt::w8>(tx, ty, tg, size, out);
+    return c_t;
+  }
+#endif
+#ifdef VEXT_W4_AVAILABLE
+  if (size % VDatum<VExt::w4>::kWidth == 0) {
+    vext::highway<VExt::w4>(tx, ty, tg, size, out);
+    return c_t;
+  }
+#endif
+
   for (size_t i = 0; i < size; i++) {
     float sg = sigmoid(tg[i]);
     float vx = tx[i];

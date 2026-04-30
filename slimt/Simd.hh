@@ -118,6 +118,26 @@ void sigmoid(const float* a, size_t size, float* c) {
 }
 
 template <VExt Width>
+void highway(const float* x, const float* y, const float* g, size_t size,
+             float* out) {
+  // out[i] = sigmoid(g[i]) * x[i] + (1 - sigmoid(g[i])) * y[i]
+  //        = y[i] + sigmoid(g[i]) * (x[i] - y[i])
+  using Element = VDatum<Width>;
+  size_t v_steps = size / Element::kWidth;
+
+  const auto* vx = reinterpret_cast<const Element*>(x);
+  const auto* vy = reinterpret_cast<const Element*>(y);
+  const auto* vg = reinterpret_cast<const Element*>(g);
+  auto* vout = reinterpret_cast<Element*>(out);
+
+  for (size_t i = 0; i < v_steps; ++i) {
+    Element sg = Ops<Width>::sigmoid(vg[i]);
+    Element diff = Ops<Width>::sub(vx[i], vy[i]);
+    vout[i] = Ops<Width>::add(vy[i], Ops<Width>::mul(sg, diff));
+  }
+}
+
+template <VExt Width>
 void layer_norm(const float* in, const float* scale, const float* bias,
                 float eps, size_t rows, size_t cols, float* out) {
   using Element = VDatum<Width>;
