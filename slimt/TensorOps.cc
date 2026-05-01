@@ -499,7 +499,12 @@ inline void matrix_multiply<Provider::Ruy>(  //
   (void)lda;
   (void)ldb;
   (void)ldc;
-  ruy::Context context;
+  // Cache one ruy::Context per worker thread. Constructing it per call burns
+  // ~5 % of inference wall time on `Ctx::SelectPath` (CpuInfo + getenv) which
+  // never changes after first init. ruy::Context is documented as
+  // thread-compatible (one per consumer thread) and keeps its internal
+  // thread-pool warm across calls.
+  thread_local ruy::Context context;
 
   // If we need to transpose, we can swap dimensions in layout claim the matrix
   // is just column-major. Set ordering so transpose.

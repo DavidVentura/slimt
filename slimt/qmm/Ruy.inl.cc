@@ -76,7 +76,7 @@ Tensor affine<Provider::Ruy>(const Tensor& x, const Tensor& W, const Tensor& b,
   detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
                    prepared_A.data<int8_t>());
 
-  ruy::Context context;
+  thread_local ruy::Context context;
   ruy::Matrix<std::int8_t> lhs;
   ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
                         lhs.mutable_layout());
@@ -139,7 +139,7 @@ Tensor affine_with_select<Provider::Ruy>(const Tensor& x, const Tensor& W,
   detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
                    prepared_A.data<int8_t>());
 
-  ruy::Context context;
+  thread_local ruy::Context context;
   ruy::Matrix<std::int8_t> lhs;
   ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
                         lhs.mutable_layout());
@@ -220,7 +220,7 @@ Tensor dot<Provider::Ruy>(const Tensor& x, const Tensor& W, float a_quant,
   detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
                    prepared_A.data<int8_t>());
 
-  ruy::Context context;
+  thread_local ruy::Context context;
   ruy::Matrix<std::int8_t> lhs;
   ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
                         lhs.mutable_layout());
