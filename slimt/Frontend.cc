@@ -87,6 +87,18 @@ std::optional<TranslationCache> make_cache(size_t cache_size) {
   return std::nullopt;
 }
 
+// HTML restore needs alignment data to map translated tokens back to their
+// source tags. Callers historically had to remember to set both
+// `options.html=true` and `options.alignment=true` together; if they
+// forgot, `HTML::restore` would abort. Enforce the dependency once at the
+// frontend so consumers don't have to encode it.
+Options normalise(Options options) {
+  if (options.html) {
+    options.alignment = true;
+  }
+  return options;
+}
+
 }  // namespace
 
 Blocking::Blocking(const Config &config)
@@ -94,7 +106,8 @@ Blocking::Blocking(const Config &config)
 
 std::vector<Response> Blocking::translate(const Ptr<Model> &model,
                                           std::vector<std::string> sources,
-                                          const Options &options) {
+                                          const Options &options_in) {
+  Options options = normalise(options_in);
   Batcher batcher(config_.max_words, config_.wrap_length,
                   config_.tgt_length_limit_factor);
 
@@ -152,7 +165,8 @@ std::vector<Response> Blocking::translate(const Ptr<Model> &model,
 std::vector<Response> Blocking::pivot(const Ptr<Model> &first,
                                       const Ptr<Model> &second,
                                       std::vector<std::string> sources,
-                                      const Options &options) {
+                                      const Options &options_in) {
+  Options options = normalise(options_in);
   std::vector<HTML> htmls;
   // Strip any existing HTML.
   if (options.html) {
@@ -261,7 +275,8 @@ Async::Async(const Config &config)
 }
 
 Handle Async::translate(const Ptr<Model> &model, std::string source,
-                        const Options &options) {
+                        const Options &options_in) {
+  Options options = normalise(options_in);
   std::shared_ptr<HTML> html = nullptr;
   if (options.html) {
     html = std::make_shared<HTML>(source);
@@ -292,7 +307,8 @@ Handle Async::translate(const Ptr<Model> &model, std::string source,
 }
 
 Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
-                    std::string source, const Options &options) {
+                    std::string source, const Options &options_in) {
+  Options options = normalise(options_in);
   Ptr<HTML> html = nullptr;
   if (options.html) {
     html = std::make_shared<HTML>(source);
