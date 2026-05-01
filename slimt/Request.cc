@@ -34,7 +34,8 @@ size_t cache_key(size_t model_id, const Words &words, bool with_alignment) {
 Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
                  Segments &&segments, const Vocabulary &vocabulary,
                  std::optional<TranslationCache> &cache,
-                 Continuation &&continuation, bool with_alignment)
+                 Continuation &&continuation, OnError &&on_error,
+                 bool with_alignment)
     : id_(id),
       model_id_(model_id),
       source_(std::move(source)),
@@ -42,6 +43,7 @@ Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
       vocabulary_(vocabulary),
       cache_(cache),
       continuation_(std::move(continuation)),
+      on_error_(std::move(on_error)),
       with_alignment_(with_alignment) {
   counter_ = segments_.size();
   histories_.resize(segments_.size(), nullptr);
@@ -116,6 +118,20 @@ size_t Request::word_count(size_t index) const {
 }
 
 const Segment &Request::segment(size_t index) const { return segments_[index]; }
+
+void Request::abort(std::exception_ptr eptr) {
+  // First caller wins. Subsequent calls (e.g. from sibling SegmentRefs in
+  // the same failed batch) are dropped — `on_error_` is allowed to assume
+  // it fires at most once and downstream `promise->set_exception` would
+  // throw `future_already_satisfied` on the second call.
+  bool expected = false;
+  if (!aborted_.compare_exchange_strong(expected, true)) {
+    return;
+  }
+  if (on_error_) {
+    on_error_(std::move(eptr));
+  }
+}
 
 void Request::process(size_t index, History history) {
   // Concurrently called by multiple workers as a history from translation is

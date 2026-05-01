@@ -57,6 +57,16 @@ void Batch::add(const SegmentRef& segment_ref) {
   max_length_ = std::max<size_t>(max_length_, segment_ref.size());
 }
 
+void SegmentRef::abort(std::exception_ptr eptr) {
+  request_->abort(std::move(eptr));
+}
+
+void Batch::abort(std::exception_ptr eptr) {
+  for (auto& segment_ref : segment_refs_) {
+    segment_ref.abort(eptr);
+  }
+}
+
 void Batch::complete(const Histories& histories) {
   for (size_t i = 0; i < segment_refs_.size(); i++) {
     segment_refs_[i].complete(histories[i]);

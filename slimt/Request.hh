@@ -35,13 +35,19 @@ namespace slimt {
 class Request {
  public:
   using Continuation = std::function<Ptr<Request>(Response &&response)>;
+  /// Failure callback. Called at most once per Request when the worker
+  /// thread catches an exception while processing one of its batches.
+  /// Implementations typically call `promise->set_exception(eptr)` so the
+  /// caller's `future.get()` rethrows.
+  using OnError = std::function<void(std::exception_ptr)>;
+
   /// Constructs an internal representation of the Request identified by Id,
   /// processed Segments and accepts a callback (ResponseBuilder) which builds
   /// the Response upon completion of the Request.
   Request(size_t id, size_t model_id, AnnotatedText &&source,
           Segments &&segments, const Vocabulary &vocabulary,
           std::optional<TranslationCache> &cache, Continuation &&continuation,
-          bool with_alignment);
+          OnError &&on_error, bool with_alignment);
 
   /// Obtain the count of tokens in the segment correponding to index. Used to
   /// insert segment from multiple requests into the corresponding size
@@ -62,6 +68,12 @@ class Request {
   /// Processes a history obtained after translating in a heterogenous batch
   /// compiled from requests.
   void process(size_t index, History history);
+
+  /// Forwards `eptr` to the failure callback (typically setting an exception
+  /// on the caller's promise). Idempotent — only the first call propagates;
+  /// later calls are dropped, since multiple SegmentRefs from the same
+  /// Request can land in the same failed batch.
+  void abort(std::exception_ptr eptr);
 
   bool cached(size_t index) const;
 
@@ -102,6 +114,13 @@ class Request {
   std::optional<TranslationCache> &cache_;
 
   Continuation continuation_;
+  /// Failure callback fired by `abort()`. May be empty for Requests created
+  /// by call sites that don't expose a separate error channel; in that case
+  /// `abort()` is a no-op and the future never completes — the worker has
+  /// to handle that.
+  OnError on_error_;
+  /// Guards `on_error_` so the callback fires at most once per Request.
+  std::atomic<bool> aborted_{false};
   Ptr<Request> next_ = nullptr;
 
   // Whether alignment data is required in the Response. Folded into the

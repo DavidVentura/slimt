@@ -38,6 +38,11 @@ class SegmentRef {
   /// SegmentRef.
   void complete(History history);
 
+  /// Forwards an exception to the parent Request's failure callback. Sibling
+  /// SegmentRefs from the same Request all hit the same Request::abort,
+  /// which is idempotent so duplicates are dropped.
+  void abort(std::exception_ptr eptr);
+
   friend bool operator<(const SegmentRef &a, const SegmentRef &b);
 
  private:
@@ -71,6 +76,12 @@ class Batch {
   // SegmentRef and triggers completion, by setting the promised value to
   // the future given to client.
   void complete(const Histories &histories);
+
+  /// Failure path: forward `eptr` to every SegmentRef in this batch so each
+  /// distinct parent Request's `abort()` fires (and via `on_error_` sets an
+  /// exception on the caller's promise). Used by the Async worker when the
+  /// translation pipeline throws.
+  void abort(std::exception_ptr eptr);
 
   // Convenience function to log batch-statistics. size, max-length.
   void log();

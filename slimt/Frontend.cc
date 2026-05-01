@@ -44,26 +44,37 @@ void exhaust(const Config &config, const Ptr<Model> &model, Batcher &batcher) {
   AverageMeter<float> occupancy;
   Batch batch = batcher.generate();
   while (!batch.empty()) {
-    // convert between batches.
-    Timer timer;
-    Input input = convert(batch, model->vocabulary().pad_id(),
-                          config.tgt_length_limit_factor);
-    Histories histories = model->forward(input);
-    batch.complete(histories);
-    batch = batcher.generate();
+    // Mirror the Async worker: a throw in convert/forward/complete must NOT
+    // strand the in-flight promises forever. Forward the exception into
+    // each parent Request via `batch.abort`; the per-Request `on_error_`
+    // callback (set up by the caller) translates that into
+    // `promise.set_exception` so the synchronous future.get() loop in
+    // Blocking::translate / pivot rethrows on the calling thread instead
+    // of hanging.
+    try {
+      Timer timer;
+      Input input = convert(batch, model->vocabulary().pad_id(),
+                            config.tgt_length_limit_factor);
+      Histories histories = model->forward(input);
+      batch.complete(histories);
 
-    auto elapsed = static_cast<float>(timer.elapsed());
-    float sample_wps = input.words().size() / elapsed;
-    wps.record(sample_wps);
-    occupancy.record(input.occupancy());
+      auto elapsed = static_cast<float>(timer.elapsed());
+      float sample_wps = input.words().size() / elapsed;
+      wps.record(sample_wps);
+      occupancy.record(input.occupancy());
+    } catch (...) {
+      batch.abort(std::current_exception());
+    }
+    batch = batcher.generate();
   }
 }
 
-template <class Continuation>
+template <class Continuation, class OnError>
 Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
                           std::optional<TranslationCache> &cache,
                           AnnotatedText &&annotated_text, Segments &&segments,
-                          Continuation &&continuation, bool with_alignment) {
+                          Continuation &&continuation, OnError &&on_error,
+                          bool with_alignment) {
   auto request = std::make_shared<Request>(      //
       id, model->id(),                           //
       std::move(annotated_text),                 //
@@ -74,6 +85,7 @@ Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
       model->target_vocabulary(),                //
       cache,                                     //
       std::forward<Continuation>(continuation),  //
+      std::forward<OnError>(on_error),           //
       with_alignment                             //
   );
   return request;
@@ -139,12 +151,15 @@ std::vector<Response> Blocking::translate(const Ptr<Model> &model,
       promise.set_value(std::move(response));
       return nullptr;
     };
+    auto on_error = [&promise](std::exception_ptr eptr) {
+      promise.set_exception(std::move(eptr));
+    };
 
     const auto &processor = model->processor();
     auto [annotated, segments] =
         processor.process(std::move(source), config_.wrap_length);
     auto request = make_request(id(), model, cache_, std::move(annotated),
-                                std::move(segments), continuation,
+                                std::move(segments), continuation, on_error,
                                 /*with_alignment=*/options.alignment);
 
     batcher.enqueue(request);
@@ -192,6 +207,10 @@ std::vector<Response> Blocking::pivot(const Ptr<Model> &first,
   Batcher batcher(config_.max_words, config_.wrap_length,
                   config_.tgt_length_limit_factor);
 
+  // Holds the first exception fired by any second-leg request, to be
+  // rethrown from this thread after exhaust returns.
+  std::exception_ptr pivot_error;
+
   for (size_t i = 0; i < source_to_pivots.size(); i++) {
     Response &source_to_pivot = source_to_pivots[i];
     Response &response = responses[i];
@@ -203,17 +222,27 @@ std::vector<Response> Blocking::pivot(const Ptr<Model> &first,
       response = std::move(combined);
       return nullptr;
     };
+    // Blocking::pivot is synchronous and uses out-parameters instead of a
+    // promise; capture the exception in the closure so we can rethrow it
+    // from this stack frame after exhaust returns.
+    auto on_error = [&pivot_error](std::exception_ptr eptr) {
+      pivot_error = std::move(eptr);
+    };
 
     const TextProcessor &processor = second->processor();
     auto [annotated, segments] = processor.process(source_to_pivot.target);
     auto request = make_request(id(), second, cache_, std::move(annotated),
-                                std::move(segments), continuation,
+                                std::move(segments), continuation, on_error,
                                 /*with_alignment=*/options.alignment);
 
     batcher.enqueue(request);
   }
 
   exhaust(config_, second, batcher);
+
+  if (pivot_error) {
+    std::rethrow_exception(pivot_error);
+  }
 
   if (options.html) {
     for (size_t i = 0; i < responses.size(); i++) {
@@ -236,30 +265,20 @@ Async::Async(const Config &config)
       Ptr<Model> model;
       std::tie(batch, model) = batcher_.generate();
       while (!batch.empty()) {
-        // convert between batches.
+        // Catch exceptions so the worker thread doesn't die, but propagate
+        // them through the in-flight Requests' failure callbacks instead of
+        // silently completing the batch with empty Histories. Each parent
+        // Request's `abort()` calls `on_error_`, which sets the exception on
+        // the caller's promise — `future.get()` then rethrows on the calling
+        // thread, the wrapper catches it, and the app sees a real error
+        // rather than an empty translation.
         try {
           Input input = convert(batch, model->vocabulary().pad_id(),
                                 config_.tgt_length_limit_factor);
           Histories histories = model->forward(input);
           batch.complete(histories);
-        } catch (const std::exception& e) {
-          // A SLIMT_ABORT*-throw, a sentencepiece/vocab error, or any other
-          // exception from convert/forward/complete must NOT kill the worker
-          // thread (which would terminate the whole process). Fulfill the
-          // in-flight Requests with empty Histories so their futures unblock
-          // with an empty Response on the calling thread, then keep serving.
-          std::cerr << "[slimt] worker caught: " << e.what() << '\n';
-          try {
-            Histories empties(batch.size());
-            for (auto& h : empties) {
-              h = std::make_shared<Hypothesis>();
-            }
-            batch.complete(empties);
-          } catch (...) {
-            // If even the empty-completion path throws, skip the batch —
-            // the corresponding futures will be lost, but the worker stays
-            // alive to serve future requests.
-          }
+        } catch (...) {
+          batch.abort(std::current_exception());
         }
         // Release the batch (which holds Ptr<Request>) and the model before
         // re-entering the blocking generate() call. Otherwise an idle worker
@@ -291,12 +310,15 @@ Handle Async::translate(const Ptr<Model> &model, std::string source,
     promise->set_value(std::move(response));
     return nullptr;
   };
+  auto on_error = [promise](std::exception_ptr eptr) {
+    promise->set_exception(std::move(eptr));
+  };
 
   const TextProcessor &processor = model->processor();
   auto [annotated, segments] =
       processor.process(std::move(source), config_.wrap_length);
   auto request = make_request(id(), model, cache_, std::move(annotated),
-                              std::move(segments), continuation,
+                              std::move(segments), continuation, on_error,
                               /*with_alignment=*/options.alignment);
 
   batcher_.enqueue(model, request);
@@ -323,7 +345,13 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
   // also asked for alignments in the final Response we propagate that to the
   // second leg.
   bool with_alignment = options.alignment;
-  auto continuation = [this, promise, second, html, with_alignment](
+  // Both legs forward exceptions to the same outer promise. Once one leg's
+  // on_error fires, Request::abort's idempotence prevents a duplicate
+  // set_exception on the same promise.
+  auto on_error = [promise](std::exception_ptr eptr) {
+    promise->set_exception(std::move(eptr));
+  };
+  auto continuation = [this, promise, second, html, with_alignment, on_error](
                           Response &&partial) -> Ptr<Request> {
     AnnotatedText intermediate = partial.target;
     auto joining_continuation =
@@ -348,7 +376,7 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
     auto request =
         make_request(id(), second, cache_, std::move(annotated),
                      std::move(segments), std::move(joining_continuation),
-                     with_alignment);
+                     on_error, with_alignment);
 
     batcher_.enqueue(second, request);
     return request;
@@ -358,7 +386,7 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
   auto [annotated, segments] =
       processor.process(std::move(source), config_.wrap_length);
   auto request = make_request(id(), first, cache_, std::move(annotated),
-                              std::move(segments), continuation,
+                              std::move(segments), continuation, on_error,
                               /*with_alignment=*/options.alignment);
 
   batcher_.enqueue(first, request);
