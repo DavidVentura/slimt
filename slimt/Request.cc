@@ -168,8 +168,13 @@ void Request::complete(Histories &&histories) {
           response.source.gap(sentence_id + 1));
     }
 
-    Alignment &alignment = histories[sentence_id]->alignment;
-    response.alignments.push_back(std::move(alignment));
+    // Copy, don't move: the Hypothesis is shared via shared_ptr through the
+    // translation cache, so multiple Requests may reference the same object.
+    // Moving would empty the alignment in the cached entry — the first
+    // consumer of a cache hit would silently strip the alignment data, and
+    // the next request hitting the same cache entry would fail
+    // `has_alignments` and trip HTML::restore's abort.
+    response.alignments.push_back(histories[sentence_id]->alignment);
   }
 
   next_ = continuation_(std::move(response));
