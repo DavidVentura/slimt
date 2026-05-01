@@ -17,8 +17,13 @@
 
 namespace slimt {
 
-size_t cache_key(size_t model_id, const Words &words) {
+size_t cache_key(size_t model_id, const Words &words, bool with_alignment) {
+  // Plain-text and HTML translations of the same sentence must NOT share a
+  // cache entry: a History stored without alignment data would be served back
+  // to an HTML request, where HTML::restore aborts on missing alignments.
+  // Folding the bool into the key keeps both variants cacheable independently.
   auto seed = model_id;
+  hash_combine<size_t>(seed, with_alignment ? 1U : 0U);
   for (size_t word : words) {
     hash_combine<size_t>(seed, word);
   }
@@ -29,14 +34,15 @@ size_t cache_key(size_t model_id, const Words &words) {
 Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
                  Segments &&segments, const Vocabulary &vocabulary,
                  std::optional<TranslationCache> &cache,
-                 Continuation &&continuation)
+                 Continuation &&continuation, bool with_alignment)
     : id_(id),
       model_id_(model_id),
       source_(std::move(source)),
       segments_(std::move(segments)),
       vocabulary_(vocabulary),
       cache_(cache),
-      continuation_(std::move(continuation)) {
+      continuation_(std::move(continuation)),
+      with_alignment_(with_alignment) {
   counter_ = segments_.size();
   histories_.resize(segments_.size(), nullptr);
 
@@ -62,7 +68,7 @@ Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
       // (counter_) to reflect one less segment to translate.
       for (size_t idx = 0; idx < segments_.size(); idx++) {
         words_total_ += segments_[idx].size();
-        size_t key = cache_key(model_id_, segment(idx));
+        size_t key = cache_key(model_id_, segment(idx), with_alignment_);
         auto [found, history] = cache_->find(key);
         if (found) {
           histories_[idx] = history;
@@ -120,7 +126,7 @@ void Request::process(size_t index, History history) {
   // store the result.
   histories_[index] = std::move(history);
   if (cache_) {
-    size_t key = cache_key(model_id_, segment(index));
+    size_t key = cache_key(model_id_, segment(index), with_alignment_);
     cache_->store(key, histories_[index]);
   }
 

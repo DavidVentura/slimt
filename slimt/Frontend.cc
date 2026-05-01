@@ -63,14 +63,15 @@ template <class Continuation>
 Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
                           std::optional<TranslationCache> &cache,
                           AnnotatedText &&annotated_text, Segments &&segments,
-                          Continuation &&continuation) {
-  auto request = std::make_shared<Request>(     //
-      id, model->id(),                          //
-      std::move(annotated_text),                //
-      std::move(segments),                      //
-      model->vocabulary(),                      //
-      cache,                                    //
-      std::forward<Continuation>(continuation)  //
+                          Continuation &&continuation, bool with_alignment) {
+  auto request = std::make_shared<Request>(      //
+      id, model->id(),                           //
+      std::move(annotated_text),                 //
+      std::move(segments),                       //
+      model->vocabulary(),                       //
+      cache,                                     //
+      std::forward<Continuation>(continuation),  //
+      with_alignment                             //
   );
   return request;
 }
@@ -127,7 +128,8 @@ std::vector<Response> Blocking::translate(const Ptr<Model> &model,
     auto [annotated, segments] =
         processor.process(std::move(source), config_.wrap_length);
     auto request = make_request(id(), model, cache_, std::move(annotated),
-                                std::move(segments), continuation);
+                                std::move(segments), continuation,
+                                /*with_alignment=*/options.alignment);
 
     batcher.enqueue(request);
   }
@@ -188,7 +190,8 @@ std::vector<Response> Blocking::pivot(const Ptr<Model> &first,
     const TextProcessor &processor = second->processor();
     auto [annotated, segments] = processor.process(source_to_pivot.target);
     auto request = make_request(id(), second, cache_, std::move(annotated),
-                                std::move(segments), continuation);
+                                std::move(segments), continuation,
+                                /*with_alignment=*/options.alignment);
 
     batcher.enqueue(request);
   }
@@ -275,7 +278,8 @@ Handle Async::translate(const Ptr<Model> &model, std::string source,
   auto [annotated, segments] =
       processor.process(std::move(source), config_.wrap_length);
   auto request = make_request(id(), model, cache_, std::move(annotated),
-                              std::move(segments), continuation);
+                              std::move(segments), continuation,
+                              /*with_alignment=*/options.alignment);
 
   batcher_.enqueue(model, request);
 
@@ -295,11 +299,13 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
   auto promise = std::make_shared<Promise>();
   auto future = promise->get_future();
 
-  auto continuation = [this, promise, second,
-                       html](Response &&partial) -> Ptr<Request> {
-    // https://stackoverflow.com/a/65606554/4565794
-    // Move semantics only work on mutable lambdas, and can only be done once.
-    // It's only once in our case, so issok.
+  // The first leg's request always needs alignments because pivoting recombines
+  // alignments across the source→pivot and pivot→target steps; if the user
+  // also asked for alignments in the final Response we propagate that to the
+  // second leg.
+  bool with_alignment = options.alignment;
+  auto continuation = [this, promise, second, html, with_alignment](
+                          Response &&partial) -> Ptr<Request> {
     AnnotatedText intermediate = partial.target;
     auto joining_continuation =
         [source_to_pivot = std::move(partial), promise,
@@ -322,7 +328,8 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
 
     auto request =
         make_request(id(), second, cache_, std::move(annotated),
-                     std::move(segments), std::move(joining_continuation));
+                     std::move(segments), std::move(joining_continuation),
+                     with_alignment);
 
     batcher_.enqueue(second, request);
     return request;
@@ -332,7 +339,8 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
   auto [annotated, segments] =
       processor.process(std::move(source), config_.wrap_length);
   auto request = make_request(id(), first, cache_, std::move(annotated),
-                              std::move(segments), continuation);
+                              std::move(segments), continuation,
+                              /*with_alignment=*/options.alignment);
 
   batcher_.enqueue(first, request);
 

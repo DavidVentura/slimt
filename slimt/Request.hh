@@ -40,7 +40,8 @@ class Request {
   /// the Response upon completion of the Request.
   Request(size_t id, size_t model_id, AnnotatedText &&source,
           Segments &&segments, const Vocabulary &vocabulary,
-          std::optional<TranslationCache> &cache, Continuation &&continuation);
+          std::optional<TranslationCache> &cache, Continuation &&continuation,
+          bool with_alignment);
 
   /// Obtain the count of tokens in the segment correponding to index. Used to
   /// insert segment from multiple requests into the corresponding size
@@ -102,6 +103,11 @@ class Request {
 
   Continuation continuation_;
   Ptr<Request> next_ = nullptr;
+
+  // Whether alignment data is required in the Response. Folded into the
+  // cache key so plain-text and HTML translations of the same sentence keep
+  // separate cache entries.
+  bool with_alignment_ = false;
 };
 
 }  // namespace slimt
