@@ -29,20 +29,24 @@
   SLIMT_TRACE2(x, y);         \
   SLIMT_TRACE(z);
 
-// Throw instead of std::abort so callers can catch and recover. Real-world
-// inputs (especially HTML from the wild) routinely trip these checks; on
-// Android, std::abort would take the whole process down with a SIGABRT that
-// no try/catch can intercept.
-#define SLIMT_ABORT_IF(condition, error)                              \
-  do {                                                                \
-    if (condition) {                                                  \
-      throw std::runtime_error(std::string("[slimt] ") + (error));    \
-    }                                                                 \
+// SLIMT_ABORT* signals a corrupt input file or a slimt invariant failure
+// (programmer error). These are unrecoverable — abort gives a real stack
+// trace and surfaces the bug rather than letting it propagate as a silent
+// translation failure. For paths whose failures are user-input-driven and
+// genuinely recoverable (HTML parsing, primarily), throw `std::runtime_error`
+// directly rather than reusing this macro.
+#define SLIMT_ABORT_IF(condition, error) \
+  do {                                   \
+    if (condition) {                     \
+      std::cerr << (error) << '\n';      \
+      std::abort();                      \
+    }                                    \
   } while (0)
 
-#define SLIMT_ABORT(message)                                          \
-  do {                                                                \
-    throw std::runtime_error(std::string("[slimt] ") + (message));    \
+#define SLIMT_ABORT(message) \
+  do {                       \
+    std::cerr << (message);  \
+    std::abort();            \
   } while (0)
 
 #ifdef SLIMT_ENABLE_LOG

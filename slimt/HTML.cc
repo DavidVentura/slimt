@@ -18,6 +18,27 @@
 #include "slimt/Types.hh"
 #include "slimt/XHScanner.hh"
 
+namespace {
+
+/// HTML parse errors are user-input-driven (real-world web pages have
+/// malformed markup, mismatched tags, vendor-specific entities, etc.) and
+/// must stay recoverable so a single bad fragment doesn't take down the
+/// whole translation pipeline. These helpers throw `std::runtime_error`
+/// instead of going through the `SLIMT_ABORT*` macros, which are reserved
+/// for load-time corruption and slimt invariant failures.
+[[noreturn]] void html_throw(const std::string &message) {
+  throw std::runtime_error(std::string("[slimt] ") + message);
+}
+
+}  // namespace
+
+#define HTML_THROW_IF(cond, message) \
+  do {                               \
+    if (cond) {                      \
+      html_throw(message);           \
+    }                                \
+  } while (0)
+
 namespace detail {
 
 /// Very simple replacement for std::format introduced in C++20. Only supports
@@ -293,9 +314,9 @@ void consume_ignored_tag(markup::Scanner &scanner, HTML::Tag &tag,
     token = scanner.next();
     switch (token) {
       case markup::Scanner::TT_ERROR:
-        SLIMT_ABORT("HTML parse error");
+        html_throw("HTML parse error");
       case markup::Scanner::TT_EOF:
-        SLIMT_ABORT("Did not find closing tag</" + name + ">");
+        html_throw("Did not find closing tag</" + name + ">");
       case markup::Scanner::TT_ATTRIBUTE:
         tag.attributes +=
             detail::format(" {}=\"{}\"", scanner.attribute(), scanner.value());
@@ -318,9 +339,9 @@ void consume_ignored_tag(markup::Scanner &scanner, HTML::Tag &tag,
   while (inside) {
     switch (token) {
       case markup::Scanner::TT_ERROR:
-        SLIMT_ABORT("HTML parse error");
+        html_throw("HTML parse error");
       case markup::Scanner::TT_EOF:
-        SLIMT_ABORT("Did not find closing tag </{}>");
+        html_throw("Did not find closing tag </{}>");
       case markup::Scanner::TT_TAG_START:
         // Note: Looking specifically for only our own type of tag so we don't
         // have to care about whether other tags we encounter are void tags or
@@ -356,7 +377,7 @@ void consume_ignored_tag(markup::Scanner &scanner, HTML::Tag &tag,
 
 namespace slimt {
 
-/// Formatters used for formatting error messages in SLIMT_ABORT() calls.
+/// Formatters used for formatting error messages in html_throw() calls.
 std::ostream &operator<<(std::ostream &out, const HTML::Tag *tag) {
   if (tag == nullptr) return out << "[nullptr]";
   switch (tag->type) {
@@ -403,7 +424,7 @@ HTML::HTML(std::string &source, Options &&options)
   while (!stop) {
     switch (scanner.next()) {
       case markup::Scanner::TT_ERROR:
-        SLIMT_ABORT("HTML parse error");
+        html_throw("HTML parse error");
 
       case markup::Scanner::TT_EOF:
         stop = true;
@@ -494,13 +515,13 @@ HTML::HTML(std::string &source, Options &&options)
         // bit of "<img/>", then completely ignore it.
         if (contains(options_.void_tags, tag_name)) break;
 
-        SLIMT_ABORT_IF(
+        HTML_THROW_IF(
             stack.empty(),
             detail::format(
                 "Encountered more closing tags ({}) than opening tags",
                 scanner.tag()));
 
-        SLIMT_ABORT_IF(
+        HTML_THROW_IF(
             to_lower_case(stack.back()->name) != to_lower_case(scanner.tag()),
             detail::format(
                 "Encountered unexpected closing tag </{}>, stack is {}",
@@ -555,12 +576,12 @@ HTML::HTML(std::string &source, Options &&options)
         break;
 
       default:
-        SLIMT_ABORT("Unsupported scanner token type");
+        html_throw("Unsupported scanner token type");
     }
   }
 
-  SLIMT_ABORT_IF(!stack.empty(),
-                 detail::format("Not all tags were closed: {}", stack));
+  HTML_THROW_IF(!stack.empty(),
+                detail::format("Not all tags were closed: {}", stack));
 
   // Add a trailing span (that's empty) to signify all closed tags.
   spans_.emplace_back(Span{source.size(), source.size(), stack});
@@ -572,7 +593,10 @@ void HTML::restore(Response &response) {
   if (spans_.empty()) return;
 
   // We need alignment info to transfer the HTML tags from the input to the
-  // translation. If those are not available, no HTML in translations for you.
+  // translation. The frontend's `Async`/`Blocking::translate` already
+  // enforce `options.alignment = true` when `options.html` is set, so this
+  // is defence-in-depth — if it ever fires, the model produced an
+  // alignment-free response despite being asked for one (a slimt bug).
   SLIMT_ABORT_IF(
       !has_alignments(response),
       "Response object does not contain alignments. Options misconfigured?");
