@@ -167,11 +167,10 @@ Tensor affine_with_select<Provider::Ruy>(const Tensor& x, const Tensor& W,
   rhs.set_data(selected_B.data<int8_t>());
 
   // Once again, bias needn't be prepared. But needs to be selected.
-  const Tensor& prepared_bias = bias;
   Tensor selected_bias(Type::f32, Shape({indices.size()}), "selected_bias");
   auto* selected_bias_ptr = selected_bias.data<float>();
   for (uint32_t index : indices) {
-    *(selected_bias_ptr) = *(prepared_bias.data<float>() + index);
+    *(selected_bias_ptr) = *(bias.data<float>() + index);
     ++selected_bias_ptr;
   }
 
@@ -191,10 +190,14 @@ Tensor affine_with_select<Provider::Ruy>(const Tensor& x, const Tensor& W,
   ruy::MulParams<std::int32_t, std::int32_t> mul_params;
   ruy::Mul(lhs, rhs, mul_params, &context, &dst);
 
-  // Unquantizes, then adds bias in a single statement on the output.
+  // Unquantizes, then adds bias in a single statement on the output. Use the
+  // selected bias here — `bias` is the full vector for the unselected output
+  // dimension, while the int32 GEMM result we're unquantizing is sized after
+  // the shortlisted columns. Mixing the two produced wrong logits and turned
+  // every translation into a stuck token (e.g. "complicated complicated…").
   Tensor y(Type::f32, out_shape, name + "_out");  // NOLINT
   float unquant_multiplier = 1.0F / (a_quant * b_quant);
-  detail::unquantizeAddBias(AB.data<int32_t>(), prepared_bias.data<float>(),
+  detail::unquantizeAddBias(AB.data<int32_t>(), selected_bias.data<float>(),
                             unquant_multiplier, A_rows, selected_B_cols,
                             y.data<float>());
   return y;
