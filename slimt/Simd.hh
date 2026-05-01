@@ -184,52 +184,76 @@ template <VExt Width>
 void softmax(const float* logits_in, size_t batch_size, size_t num_classes,
              float* out_in) {
   // Attention softmax operates over variable-length sequences, so per-row
-  // pointers are not 32-byte aligned in general — use unaligned load/store
-  // and a scalar tail.
+  // pointers are not 32-byte aligned in general — use unaligned load/store.
+  //
+  // The trailing `< kWidth` lanes used to fall through to scalar `std::exp`,
+  // which routed to libc's `__expf_fma` and showed up as ~1 % of total wall
+  // in the flamegraph — multiplied by every attention call. Avoid the
+  // scalar tail by using a back-shifted vector load that overlaps the
+  // already-processed tail of the row: re-loading and re-exping a few
+  // elements with the same vector kernel writes back the same values, so
+  // the only correction needed is to add only the *new* lanes to the row
+  // sum.
   using Element = VDatum<Width>;
   using Scalar = typename Ops<Width>::Scalar;
   constexpr size_t kWidth = Element::kWidth;
   size_t aligned = (num_classes / kWidth) * kWidth;
+  size_t tail = num_classes - aligned;
 
   for (size_t j = 0; j < batch_size; ++j) {
     const float* logit = logits_in + j * num_classes;
     float* p = out_in + j * num_classes;
 
-    // Pass 1: max.
-    Scalar max_scalar;
-    if (aligned > 0) {
-      Element vmax = Ops<Width>::loadu(logit);
-      for (size_t i = kWidth; i < aligned; i += kWidth) {
-        vmax = Ops<Width>::max(vmax, Ops<Width>::loadu(logit + i));
-      }
-      max_scalar = Ops<Width>::Reduce::max(vmax);
-      for (size_t i = aligned; i < num_classes; ++i) {
-        max_scalar = std::max(max_scalar, logit[i]);
-      }
-    } else {
-      max_scalar = logit[0];
+    // Rows shorter than one vector lane fall through to scalar — there's no
+    // safe back-shifted load.
+    if (num_classes < kWidth) {
+      Scalar max_scalar = logit[0];
       for (size_t i = 1; i < num_classes; ++i) {
         max_scalar = std::max(max_scalar, logit[i]);
       }
+      Scalar sum_scalar = 0.0F;
+      for (size_t i = 0; i < num_classes; ++i) {
+        Scalar e = std::exp(logit[i] - max_scalar);
+        p[i] = e;
+        sum_scalar += e;
+      }
+      for (size_t i = 0; i < num_classes; ++i) p[i] /= sum_scalar;
+      continue;
     }
+
+    // Pass 1: max.
+    Element vmax = Ops<Width>::loadu(logit);
+    for (size_t i = kWidth; i < aligned; i += kWidth) {
+      vmax = Ops<Width>::max(vmax, Ops<Width>::loadu(logit + i));
+    }
+    if (tail > 0) {
+      vmax = Ops<Width>::max(
+          vmax, Ops<Width>::loadu(logit + num_classes - kWidth));
+    }
+    Scalar max_scalar = Ops<Width>::Reduce::max(vmax);
     Element vmax_broadcast(max_scalar);
 
     // Pass 2: shift by max, exp, accumulate sum, store exp values.
-    Scalar sum_scalar = 0.0F;
-    if (aligned > 0) {
-      Element vsum(0.0F);
-      for (size_t i = 0; i < aligned; i += kWidth) {
-        Element x = Ops<Width>::loadu(logit + i);
-        Element e = Ops<Width>::exp(Ops<Width>::sub(x, vmax_broadcast));
-        vsum = Ops<Width>::add(vsum, e);
-        Ops<Width>::storeu(p + i, e);
-      }
-      sum_scalar = Ops<Width>::Reduce::sum(vsum);
+    Element vsum(0.0F);
+    for (size_t i = 0; i < aligned; i += kWidth) {
+      Element x = Ops<Width>::loadu(logit + i);
+      Element e = Ops<Width>::exp(Ops<Width>::sub(x, vmax_broadcast));
+      vsum = Ops<Width>::add(vsum, e);
+      Ops<Width>::storeu(p + i, e);
     }
-    for (size_t i = aligned; i < num_classes; ++i) {
-      Scalar e = std::exp(logit[i] - max_scalar);
-      p[i] = e;
-      sum_scalar += e;
+    Scalar sum_scalar = Ops<Width>::Reduce::sum(vsum);
+    if (tail > 0) {
+      // Back-shifted tail vector: covers [num_classes - kWidth, num_classes).
+      // The first (kWidth - tail) lanes overlap with the last aligned vector;
+      // re-storing the same exp values is harmless. Only the last `tail`
+      // lanes contribute new sum mass.
+      size_t start = num_classes - kWidth;
+      Element x = Ops<Width>::loadu(logit + start);
+      Element e = Ops<Width>::exp(Ops<Width>::sub(x, vmax_broadcast));
+      Ops<Width>::storeu(p + start, e);
+      alignas(64) Scalar tmp[kWidth];
+      Ops<Width>::storeu(tmp, e);
+      for (size_t k = kWidth - tail; k < kWidth; ++k) sum_scalar += tmp[k];
     }
 
     // Pass 3: normalize.
@@ -238,8 +262,10 @@ void softmax(const float* logits_in, size_t batch_size, size_t num_classes,
       Element e = Ops<Width>::loadu(p + i);
       Ops<Width>::storeu(p + i, Ops<Width>::div(e, vsum_broadcast));
     }
-    for (size_t i = aligned; i < num_classes; ++i) {
-      p[i] /= sum_scalar;
+    if (tail > 0) {
+      size_t start = num_classes - kWidth;
+      Element e = Ops<Width>::loadu(p + start);
+      Ops<Width>::storeu(p + start, Ops<Width>::div(e, vsum_broadcast));
     }
   }
 }
