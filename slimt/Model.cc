@@ -70,7 +70,7 @@ Model::Model(const Config &config, const Package<View> &package)
       view_(package),
       src_vocabulary_(package.vocabulary),
       tgt_vocabulary_(maybe_target_vocabulary(package.target_vocabulary)),
-      processor_(config.split_mode, src_vocabulary_, Aligned()),
+      processor_(src_vocabulary_),
       transformer_(config.encoder_layers, config.decoder_layers,
                    config.num_heads, config.feed_forward_depth, package.model),
       shortlist_generator_(make_shortlist_generator(
@@ -83,7 +83,7 @@ Model::Model(const Config &config, const Package<std::string> &package)
       view_(view_from(*mmap_)),
       src_vocabulary_(view_.vocabulary),
       tgt_vocabulary_(maybe_target_vocabulary(view_.target_vocabulary)),
-      processor_(config.split_mode, src_vocabulary_, Aligned()),
+      processor_(src_vocabulary_),
       transformer_(config.encoder_layers, config.decoder_layers,
                    config.num_heads, config.feed_forward_depth, view_.model),
       shortlist_generator_(make_shortlist_generator(
@@ -373,7 +373,6 @@ Model::Config tiny() {
       .decoder_layers = 2,      //
       .feed_forward_depth = 2,  //
       .num_heads = 8,           //
-      .split_mode = "wrapped_text"  //
   };
   // NOLINTEND
   return config;
@@ -386,7 +385,6 @@ Model::Config base() {
       .decoder_layers = 2,      //
       .feed_forward_depth = 2,  //
       .num_heads = 8,           //
-      .split_mode = "wrapped_text"  //
   };
   // NOLINTEND
   return config;
@@ -399,7 +397,6 @@ Model::Config nano() {
       .decoder_layers = 2,      //
       .feed_forward_depth = 2,  //
       .num_heads = 8,           //
-      .split_mode = "wrapped_text"  //
   };
   // NOLINTEND
   return config;

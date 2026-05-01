@@ -48,7 +48,6 @@ class SLIMT_EXPORT Model {
     size_t decoder_layers = 2;
     size_t feed_forward_depth = 2;
     size_t num_heads = 8;
-    std::string split_mode = "sentence";
     template <class App>
     void setup_onto(App &app) {
       // clang-format off
@@ -56,7 +55,6 @@ class SLIMT_EXPORT Model {
       app.add_option("--decoder-layers", decoder_layers, "Number of decoder layers");
       app.add_option("--num-heads", num_heads, "Number of decoder layers");
       app.add_option("--ffn-depth", decoder_layers, "Number of feedforward layers");
-      app.add_option("--split-mode", split_mode, "Split mode to go with for sentence-splitter.");
       // clang-format on
     }
     // NOLINTEND

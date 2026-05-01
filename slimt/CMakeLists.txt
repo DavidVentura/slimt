@@ -10,7 +10,6 @@ set(SLIMT_PUBLIC_HEADERS
     Modules.hh
     Response.hh
     Shortlist.hh
-    Splitter.hh
     Tensor.hh
     TextProcessor.hh
     Transformer.hh
@@ -29,7 +28,6 @@ set(SLIMT_GENERATED_HEADERS ${CMAKE_CURRENT_BINARY_DIR}/Version.hh
 
 set(SLIMT_PRIVATE_HEADERS
     QMM.hh
-    Regex.hh
     Request.hh
     TensorOps.hh
     Utils.hh)
@@ -45,11 +43,9 @@ set(SLIMT_SOURCES
     Model.cc
     Modules.cc
     QMM.cc
-    Regex.cc
     Request.cc
     Response.cc
     Shortlist.cc
-    Splitter.cc
     Tensor.cc
     TensorOps.cc
     TextProcessor.cc

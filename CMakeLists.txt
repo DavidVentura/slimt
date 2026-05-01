@@ -18,7 +18,6 @@ option(WITH_RUY "Use ruy" OFF)
 option(WITH_GEMMOLOGY "Use gemmology" ON)
 option(WITH_BLAS "Use BLAS. Otherwise moves to ruy" ON)
 
-option(SLIMT_USE_INTERNAL_PCRE2 "Use external PCRE2, not system" OFF)
 option(USE_BUILTIN_SENTENCEPIECE "Use SentencePiece supplied as 3rd-party" ON)
 
 option(USE_AVX512 "Use AVX512" OFF)
@@ -79,10 +78,8 @@ if(WITH_TCMALLOC)
   list(APPEND SLIMT_PRIVATE_LIBS ${TCMALLOC_LIBRARIES})
 endif(WITH_TCMALLOC)
 
-find_package(PCRE2 REQUIRED)
 add_subdirectory(3rd-party)
 
-list(APPEND SLIMT_PRIVATE_LIBS PCRE2::PCRE2)
 list(APPEND SLIMT_PUBLIC_LIBS SentencePiece::SentencePiece)
 
 if(NOT USE_BUILTIN_SENTENCEPIECE)
