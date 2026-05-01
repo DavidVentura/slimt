@@ -275,4 +275,42 @@ void prepare_weight_quantized_transposed<Provider::Ruy>(const int8_t* input,
   std::memcpy(output, input,
               /*count=*/sizeof(int8_t) * (rows * cols));
 }
+
+// The "prepared bias" optimization is intgemm-specific: it folds the
+// shift-quantization compensation (column sums of W * a_quant_shift) into
+// the bias once so subsequent affine calls can skip the per-call
+// compensation pass. Ruy uses signed-signed int8 multiplication and applies
+// the bias as a post-process, so no preparation is needed — pass the bias
+// through unchanged and route the "with prepared bias" entry points to the
+// regular ones. Without these stubs, Modules.cc refers to undefined
+// `prepare_bias<Ruy>` / `affine_with_prepared_bias<Ruy>` /
+// `affine_with_select_prepared_bias<Ruy>`, producing a libslimt.a that
+// silently fails to dlopen on ARM.
+template <>
+Tensor prepare_bias<Provider::Ruy>(const Tensor& W, const Tensor& b,
+                                   float a_quant, float b_quant,
+                                   const std::string& name) {
+  (void)W;
+  (void)a_quant;
+  (void)b_quant;
+  return b.clone(name.empty() ? "prepared_bias" : name);
+}
+
+template <>
+Tensor affine_with_prepared_bias<Provider::Ruy>(const Tensor& x,
+                                                const Tensor& W,
+                                                const Tensor& prepared_bias,
+                                                float a_quant, float b_quant,
+                                                const std::string& name) {
+  return affine<Provider::Ruy>(x, W, prepared_bias, a_quant, b_quant, name);
+}
+
+template <>
+Tensor affine_with_select_prepared_bias<Provider::Ruy>(
+    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
+    float a_quant, float b_quant, const std::vector<uint32_t>& indices,
+    const std::string& name) {
+  return affine_with_select<Provider::Ruy>(x, W, prepared_bias, a_quant,
+                                           b_quant, indices, name);
+}
 }  // namespace slimt::qmm::detail
