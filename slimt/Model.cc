@@ -373,7 +373,7 @@ Model::Config tiny() {
       .decoder_layers = 2,      //
       .feed_forward_depth = 2,  //
       .num_heads = 8,           //
-      .split_mode = "sentence"  //
+      .split_mode = "wrapped_text"  //
   };
   // NOLINTEND
   return config;
@@ -386,7 +386,7 @@ Model::Config base() {
       .decoder_layers = 2,      //
       .feed_forward_depth = 2,  //
       .num_heads = 8,           //
-      .split_mode = "sentence"  //
+      .split_mode = "wrapped_text"  //
   };
   // NOLINTEND
   return config;
@@ -399,7 +399,7 @@ Model::Config nano() {
       .decoder_layers = 2,      //
       .feed_forward_depth = 2,  //
       .num_heads = 8,           //
-      .split_mode = "sentence"  //
+      .split_mode = "wrapped_text"  //
   };
   // NOLINTEND
   return config;

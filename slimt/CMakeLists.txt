@@ -28,13 +28,11 @@ set(SLIMT_GENERATED_HEADERS ${CMAKE_CURRENT_BINARY_DIR}/Version.hh
                             ${CMAKE_CURRENT_BINARY_DIR}/Export.hh)
 
 set(SLIMT_PRIVATE_HEADERS
-    HTML.hh
     QMM.hh
     Regex.hh
     Request.hh
     TensorOps.hh
-    Utils.hh
-    XHScanner.hh)
+    Utils.hh)
 
 set(SLIMT_SOURCES
     Aligned.cc
@@ -42,7 +40,6 @@ set(SLIMT_SOURCES
     Arena.cc
     Batcher.cc
     Frontend.cc
-    HTML.cc
     Input.cc
     Io.cc
     Model.cc
@@ -58,8 +55,7 @@ set(SLIMT_SOURCES
     TextProcessor.cc
     Transformer.cc
     Utils.cc
-    Vocabulary.cc
-    XHScanner.cc)
+    Vocabulary.cc)
 
 if(WITH_GEMMOLOGY)
   list(APPEND SLIMT_SOURCES qmm/Gemmology.cc)

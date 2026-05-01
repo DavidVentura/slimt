@@ -13,7 +13,6 @@
 
 #include "slimt/Annotation.hh"
 #include "slimt/Batcher.hh"
-#include "slimt/HTML.hh"
 #include "slimt/Input.hh"
 #include "slimt/Model.hh"
 #include "slimt/Request.hh"
@@ -99,18 +98,6 @@ std::optional<TranslationCache> make_cache(size_t cache_size) {
   return std::nullopt;
 }
 
-// HTML restore needs alignment data to map translated tokens back to their
-// source tags. Callers historically had to remember to set both
-// `options.html=true` and `options.alignment=true` together; if they
-// forgot, `HTML::restore` would abort. Enforce the dependency once at the
-// frontend so consumers don't have to encode it.
-Options normalise(Options options) {
-  if (options.html) {
-    options.alignment = true;
-  }
-  return options;
-}
-
 }  // namespace
 
 Blocking::Blocking(const Config &config)
@@ -118,36 +105,22 @@ Blocking::Blocking(const Config &config)
 
 std::vector<Response> Blocking::translate(const Ptr<Model> &model,
                                           std::vector<std::string> sources,
-                                          const Options &options_in) {
-  Options options = normalise(options_in);
+                                          const Options &options) {
   Batcher batcher(config_.max_words, config_.wrap_length,
                   config_.tgt_length_limit_factor);
 
-  std::vector<HTML> htmls;
-  if (options.html) {
-    htmls.reserve(sources.size());
-    for (std::string &source : sources) {
-      htmls.emplace_back(source);
-    }
-  }
-
-  // Configure promises, and HTML
   std::vector<Promise> promises(sources.size());
   std::vector<Future> futures;
   futures.reserve(sources.size());
 
   for (size_t i = 0; i < sources.size(); i++) {
     std::string &source = sources[i];
-    HTML *html = options.html ? &(htmls[i]) : nullptr;
 
     Promise &promise = promises[i];
     Future future = promise.get_future();
     futures.push_back(std::move(future));
 
-    auto continuation = [&promise, html](Response &&response) {
-      if (html) {
-        html->restore(response);
-      }
+    auto continuation = [&promise](Response &&response) {
       promise.set_value(std::move(response));
       return nullptr;
     };
@@ -180,25 +153,10 @@ std::vector<Response> Blocking::translate(const Ptr<Model> &model,
 std::vector<Response> Blocking::pivot(const Ptr<Model> &first,
                                       const Ptr<Model> &second,
                                       std::vector<std::string> sources,
-                                      const Options &options_in) {
-  Options options = normalise(options_in);
-  std::vector<HTML> htmls;
-  // Strip any existing HTML.
-  if (options.html) {
-    htmls.reserve(sources.size());
-    for (auto &source : sources) {
-      htmls.emplace_back(source);
-    }
-  }
-
+                                      const Options &options) {
   // Translate source to pivots.
-  std::vector<Response> source_to_pivots;
-  Options raw{
-      .alignment = options.alignment,  //
-      .html = false                    //
-  };
-
-  source_to_pivots = translate(first, std::move(sources), raw);
+  std::vector<Response> source_to_pivots =
+      translate(first, std::move(sources), options);
 
   // Translate pivots to targets, after we have outputs at pivot from first
   // round.
@@ -242,12 +200,6 @@ std::vector<Response> Blocking::pivot(const Ptr<Model> &first,
 
   if (pivot_error) {
     std::rethrow_exception(pivot_error);
-  }
-
-  if (options.html) {
-    for (size_t i = 0; i < responses.size(); i++) {
-      htmls[i].restore(responses[i]);
-    }
   }
 
   return responses;
@@ -294,19 +246,10 @@ Async::Async(const Config &config)
 }
 
 Handle Async::translate(const Ptr<Model> &model, std::string source,
-                        const Options &options_in) {
-  Options options = normalise(options_in);
-  std::shared_ptr<HTML> html = nullptr;
-  if (options.html) {
-    html = std::make_shared<HTML>(source);
-  }
-
+                        const Options &options) {
   auto promise = std::make_shared<Promise>();
   auto future = promise->get_future();
-  auto continuation = [html, promise](Response &&response) {
-    if (html) {
-      html->restore(response);
-    }
+  auto continuation = [promise](Response &&response) {
     promise->set_value(std::move(response));
     return nullptr;
   };
@@ -329,21 +272,11 @@ Handle Async::translate(const Ptr<Model> &model, std::string source,
 }
 
 Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
-                    std::string source, const Options &options_in) {
-  Options options = normalise(options_in);
-  Ptr<HTML> html = nullptr;
-  if (options.html) {
-    html = std::make_shared<HTML>(source);
-  }
-
+                    std::string source, const Options &options) {
   // This is callback chaining or CPS due to async.
   auto promise = std::make_shared<Promise>();
   auto future = promise->get_future();
 
-  // The first leg's request always needs alignments because pivoting recombines
-  // alignments across the source→pivot and pivot→target steps; if the user
-  // also asked for alignments in the final Response we propagate that to the
-  // second leg.
   bool with_alignment = options.alignment;
   // Both legs forward exceptions to the same outer promise. Once one leg's
   // on_error fires, Request::abort's idempotence prevents a duplicate
@@ -351,21 +284,16 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
   auto on_error = [promise](std::exception_ptr eptr) {
     promise->set_exception(std::move(eptr));
   };
-  auto continuation = [this, promise, second, html, with_alignment, on_error](
+  auto continuation = [this, promise, second, with_alignment, on_error](
                           Response &&partial) -> Ptr<Request> {
     AnnotatedText intermediate = partial.target;
     auto joining_continuation =
-        [source_to_pivot = std::move(partial), promise,
-         html](Response &&pivot_to_target) mutable -> Ptr<Request> {
+        [source_to_pivot = std::move(partial),
+         promise](Response &&pivot_to_target) mutable -> Ptr<Request> {
       // We have both Responses at this callback, source_to_pivot is moved in,
       // second half will be available when complete.
       Response response =
           combine(std::move(source_to_pivot), std::move(pivot_to_target));
-
-      // Sentences should be consistent now, give way to client.
-      if (html) {
-        html->restore(response);
-      }
       promise->set_value(std::move(response));
       return nullptr;
     };

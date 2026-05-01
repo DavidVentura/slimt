@@ -124,8 +124,8 @@ class Request {
   Ptr<Request> next_ = nullptr;
 
   // Whether alignment data is required in the Response. Folded into the
-  // cache key so plain-text and HTML translations of the same sentence keep
-  // separate cache entries.
+  // cache key so plain-text and alignment-bearing requests for the same
+  // sentence keep separate cache entries.
   bool with_alignment_ = false;
 };
 

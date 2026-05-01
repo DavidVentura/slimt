@@ -18,10 +18,10 @@
 namespace slimt {
 
 size_t cache_key(size_t model_id, const Words &words, bool with_alignment) {
-  // Plain-text and HTML translations of the same sentence must NOT share a
-  // cache entry: a History stored without alignment data would be served back
-  // to an HTML request, where HTML::restore aborts on missing alignments.
-  // Folding the bool into the key keeps both variants cacheable independently.
+  // Plain-text and alignment-bearing translations of the same sentence must
+  // not share a cache entry: a History stored without alignment data could
+  // otherwise be returned to a caller that asked for alignments. Fold the
+  // bool into the key so both variants are independently cacheable.
   auto seed = model_id;
   hash_combine<size_t>(seed, with_alignment ? 1U : 0U);
   for (size_t word : words) {
@@ -186,10 +186,9 @@ void Request::complete(Histories &&histories) {
 
     // Copy, don't move: the Hypothesis is shared via shared_ptr through the
     // translation cache, so multiple Requests may reference the same object.
-    // Moving would empty the alignment in the cached entry — the first
-    // consumer of a cache hit would silently strip the alignment data, and
-    // the next request hitting the same cache entry would fail
-    // `has_alignments` and trip HTML::restore's abort.
+    // Moving would empty the alignment in the cached entry — the next request
+    // hitting the same cache entry would see `has_alignments == false` and
+    // miss the data the alignment-bearing caller actually asked for.
     response.alignments.push_back(histories[sentence_id]->alignment);
   }
 
