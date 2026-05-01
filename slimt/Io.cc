@@ -96,8 +96,9 @@ Type intercept(uint64_t value) {
     case OGType::float32:
       return Type::f32;
     default:
-      std::cerr << "Incompatible type.\n";
-      std::abort();
+      throw std::runtime_error(
+          "[slimt] model file contains an incompatible tensor type (" +
+          std::to_string(value) + ")");
   }
 }
 
@@ -114,11 +115,11 @@ void set_item(Item& item, Aligned&& aligned) {
 std::vector<io::Item> load_items(void* current) {
   uint64_t binary_file_version = *emit<uint64_t>(current);
   if (binary_file_version != kBinaryFileVersion) {
-    std::cerr << "Binary file versions do not match: ";
-    std::cerr << binary_file_version << "(file) != ";
-    std::cerr << kBinaryFileVersion << " (expected)";
-
-    std::abort();
+    throw std::runtime_error(
+        "[slimt] model file binary version mismatch: file is v" +
+        std::to_string(binary_file_version) + ", slimt expects v" +
+        std::to_string(kBinaryFileVersion) +
+        " (re-download or regenerate the model)");
   }
 
   // Read number of headers and based on the information, the headers.
