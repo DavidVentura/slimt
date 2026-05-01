@@ -68,7 +68,10 @@ Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
       id, model->id(),                           //
       std::move(annotated_text),                 //
       std::move(segments),                       //
-      model->vocabulary(),                       //
+      // Decoding generated word IDs back to text needs the *target* vocab,
+      // which is distinct from the source vocab on two-vocab models like
+      // bergamot's en-zh / en-ja / en-ko / en-zh_hant / zh_hant-en.
+      model->target_vocabulary(),                //
       cache,                                     //
       std::forward<Continuation>(continuation),  //
       with_alignment                             //

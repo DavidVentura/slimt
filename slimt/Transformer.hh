@@ -62,7 +62,10 @@ class Transformer {
   explicit Transformer(size_t encoder_layers, size_t decoder_layers,
                        size_t num_heads, size_t feed_forward_depth, View model);
 
-  const Tensor &embedding() const { return embedding_; }
+  // Source-side embedding (encoder input lookup). For shared-vocab models the
+  // encoder and decoder both use this tensor; for two-vocab models it's
+  // loaded from `encoder_Wemb` and is distinct from `decoder_embedding()`.
+  const Tensor &embedding() const { return encoder_embedding_; }
   const Encoder &encoder() const { return encoder_; }
   const Decoder &decoder() const { return decoder_; }
 
@@ -72,7 +75,13 @@ class Transformer {
   void prepare_biases();
 
   std::vector<io::Item> items_;
-  Tensor embedding_;
+  // Encoder input embedding. Loaded from `Wemb` (single-vocab) or
+  // `encoder_Wemb` (two-vocab).
+  Tensor encoder_embedding_;
+  // Decoder input/output embedding (tied with output projection). Loaded
+  // from `Wemb` (single-vocab — same tensor as encoder_embedding_'s source)
+  // or `decoder_Wemb` (two-vocab).
+  Tensor decoder_embedding_;
   Encoder encoder_;
   Decoder decoder_;
 };

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -23,7 +24,18 @@ class Tensor;
 template <class Field>
 struct Package {
   Field model;
+  // Source-side vocabulary, used to tokenize input. For models whose source
+  // and target vocabularies are the same (the bergamot tiny11 baseline), this
+  // is the only vocabulary present and `target_vocabulary` should be left
+  // empty / default-constructed; the Model will alias the target side to the
+  // same Vocabulary instance.
   Field vocabulary;
+  // Target-side vocabulary, used to decode generated token IDs back to text
+  // and to look up the EOS id during greedy sampling. Must be set for
+  // two-vocab models such as Mozilla's en-zh, en-ja, en-ko, en-zh_hant and
+  // zh_hant-en, which ship `srcvocab.*.spm` + `trgvocab.*.spm` and have
+  // separate `encoder_Wemb` / `decoder_Wemb` tensors in the model file.
+  Field target_vocabulary;
   Field shortlist;
   Field ssplit;
 };
@@ -56,7 +68,15 @@ class SLIMT_EXPORT Model {
   Histories forward(const Input &input) const;
 
   const Config &config() const { return config_; }
-  const Vocabulary &vocabulary() const { return vocabulary_; }
+  // Source-side vocabulary. Use this for tokenizing input and for the input
+  // batch's pad_id.
+  const Vocabulary &vocabulary() const { return src_vocabulary_; }
+  // Target-side vocabulary, used for greedy_sample's eos check and to decode
+  // generated word IDs back to text. Aliases the source vocabulary for
+  // shared-vocab models.
+  const Vocabulary &target_vocabulary() const {
+    return tgt_vocabulary_ ? *tgt_vocabulary_ : src_vocabulary_;
+  }
   const TextProcessor &processor() const { return processor_; }
   const Transformer &transformer() const { return transformer_; }
   size_t id() const { return id_; }  // NOLINT
@@ -76,7 +96,13 @@ class SLIMT_EXPORT Model {
   std::optional<Mmap> mmap_;
   Package<View> view_;
 
-  Vocabulary vocabulary_;
+  // Source vocabulary is always present. Target vocabulary is null for
+  // single-vocab models (the source vocab is reused), or owned-non-null for
+  // two-vocab models such as the bergamot CJK pairs. unique_ptr is used
+  // because Vocabulary embeds a non-copyable / non-movable
+  // SentencePieceProcessor, so it can't sit inside std::optional.
+  Vocabulary src_vocabulary_;
+  std::unique_ptr<Vocabulary> tgt_vocabulary_;
   TextProcessor processor_;
   Transformer transformer_;
   std::optional<ShortlistGenerator> shortlist_generator_;

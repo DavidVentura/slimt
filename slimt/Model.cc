@@ -36,10 +36,11 @@ Package<io::MmapFile> mmap_from(const Package<std::string> &package) {
   };
 
   return {
-      .model = maybe_mmap(package.model),            //
-      .vocabulary = maybe_mmap(package.vocabulary),  //
-      .shortlist = maybe_mmap(package.shortlist),    //
-      .ssplit = maybe_mmap(package.ssplit),          //
+      .model = maybe_mmap(package.model),                          //
+      .vocabulary = maybe_mmap(package.vocabulary),                //
+      .target_vocabulary = maybe_mmap(package.target_vocabulary),  //
+      .shortlist = maybe_mmap(package.shortlist),                  //
+      .ssplit = maybe_mmap(package.ssplit),                        //
   };
 }
 
@@ -47,9 +48,18 @@ Package<View> view_from(const Package<io::MmapFile> &mmap) {
   return {
       .model = {mmap.model.data(), mmap.model.size()},                 //
       .vocabulary = {mmap.vocabulary.data(), mmap.vocabulary.size()},  //
+      .target_vocabulary = {mmap.target_vocabulary.data(),             //
+                            mmap.target_vocabulary.size()},            //
       .shortlist = {mmap.shortlist.data(), mmap.shortlist.size()},     //
       .ssplit = {mmap.ssplit.data(), mmap.ssplit.size()},              //
   };
+}
+
+std::unique_ptr<Vocabulary> maybe_target_vocabulary(View target_view) {
+  if (target_view.data == nullptr || target_view.size == 0) {
+    return nullptr;
+  }
+  return std::make_unique<Vocabulary>(target_view);
 }
 
 }  // namespace
@@ -58,24 +68,26 @@ Model::Model(const Config &config, const Package<View> &package)
     : id_(model_id++),
       config_(config),
       view_(package),
-      vocabulary_(package.vocabulary),
-      processor_(config.split_mode, vocabulary_, Aligned()),
+      src_vocabulary_(package.vocabulary),
+      tgt_vocabulary_(maybe_target_vocabulary(package.target_vocabulary)),
+      processor_(config.split_mode, src_vocabulary_, Aligned()),
       transformer_(config.encoder_layers, config.decoder_layers,
                    config.num_heads, config.feed_forward_depth, package.model),
       shortlist_generator_(make_shortlist_generator(
-          package.shortlist, vocabulary_, vocabulary_)) {}
+          package.shortlist, src_vocabulary_, target_vocabulary())) {}
 
 Model::Model(const Config &config, const Package<std::string> &package)
     : id_(model_id++),
       config_(config),
       mmap_(mmap_from(package)),
       view_(view_from(*mmap_)),
-      vocabulary_(view_.vocabulary),
-      processor_(config.split_mode, vocabulary_, Aligned()),
+      src_vocabulary_(view_.vocabulary),
+      tgt_vocabulary_(maybe_target_vocabulary(view_.target_vocabulary)),
+      processor_(config.split_mode, src_vocabulary_, Aligned()),
       transformer_(config.encoder_layers, config.decoder_layers,
                    config.num_heads, config.feed_forward_depth, view_.model),
       shortlist_generator_(make_shortlist_generator(
-          view_.shortlist, vocabulary_, vocabulary_)) {}
+          view_.shortlist, src_vocabulary_, target_vocabulary())) {}
 
 std::optional<ShortlistGenerator> Model::make_shortlist_generator(
     View view, const Vocabulary &source, const Vocabulary &target) {
@@ -175,11 +187,12 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
     indices = shortlist.words();
   }
   // The following can be used to check if shortlist is going wrong.
-  // std::vector<uint32_t> indices(vocabulary_.size());
+  // std::vector<uint32_t> indices(target_vocab.size());
   // std::iota(indices.begin(), indices.end(), 0);
 
   std::vector<bool> complete(batch_size, false);
-  uint32_t eos = vocabulary_.eos_id();
+  const Vocabulary &target_vocab = target_vocabulary();
+  uint32_t eos = target_vocab.eos_id();
   auto record = [eos, &complete](const std::vector<size_t> &active_to_original,
                                  Words &step, Sentences &sentences) {
     size_t finished = 0;
@@ -230,10 +243,10 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
                                        indices);
 
     if (indices) {
-      previous_slice = greedy_sample_from_words(logits, vocabulary_, *indices,
+      previous_slice = greedy_sample_from_words(logits, target_vocab, *indices,
                                                 batch_size);
     } else {
-      previous_slice = greedy_sample(logits, vocabulary_, batch_size);
+      previous_slice = greedy_sample(logits, target_vocab, batch_size);
     }
 
     update_alignment(active_to_original, input.lengths(), complete, attn,
@@ -292,11 +305,11 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
       steps++;
       if (indices) {
         previous_slice =
-            greedy_sample_from_words(logits, vocabulary_, *indices,
+            greedy_sample_from_words(logits, target_vocab, *indices,
                                      active_to_original.size());
       } else {
         previous_slice =
-            greedy_sample(logits, vocabulary_, active_to_original.size());
+            greedy_sample(logits, target_vocab, active_to_original.size());
       }
       update_alignment(active_to_original, input.lengths(), complete, attn,
                        alignments);

@@ -152,8 +152,36 @@ std::vector<io::Item> load_items(void* current) {
   uint64_t offset = *emit<uint64_t>(current);
   emit<char>(current, offset);
 
-  // Keep an extra item for embedding processed.
+  // Keep extra items for the int8-prepared (PrepareB-form) versions of any
+  // embeddings that double as the decoder output projection. For shared-vocab
+  // models that's a single `Wemb_intgemm8`. For two-vocab models with
+  // separate `decoder_Wemb`, that's `decoder_Wemb_intgemm8`. Encoder-only
+  // embeddings (`encoder_Wemb`) don't need a PrepareB form since they're
+  // never used as a GEMM B-matrix.
   Item embedding_processed;
+  Item decoder_embedding_processed;
+  // Synthetic `none_QuantMultA` for two-vocab models. Shared-vocab models
+  // already ship one as a separate float32 item that the decoder output
+  // projection's `Affine::quant` reads. Two-vocab models only ship
+  // `decoder_Wemb_QuantMultA` (a placeholder marker, no useful data); the
+  // actual quantization multiplier is appended to the end of the
+  // `decoder_Wemb` data buffer. We synthesize an extra
+  // `none_QuantMultA` item carrying that float so the parameter map's
+  // existing `none_QuantMultA → output_.quant` slot still resolves.
+  Item synthesized_none_quant_mult_a;
+
+  // Recognises the three embedding tensor names slimt knows about. Anything
+  // else with name ending in "_QuantMultA" stays a quantization-multiplier
+  // marker (no-op view); other ig8 tensors are GEMM B-matrices that need
+  // PrepareBQuantizedTransposed.
+  auto is_embedding_name = [](const std::string& name) {
+    return name == "Wemb" || name == "encoder_Wemb" || name == "decoder_Wemb";
+  };
+  auto is_quant_mult_a_marker = [](const std::string& name) {
+    return name == "Wemb_QuantMultA" ||
+           name == "encoder_Wemb_QuantMultA" ||
+           name == "decoder_Wemb_QuantMultA";
+  };
 
   for (uint64_t i = 0; i < num_headers; ++i) {
     Item& item = items[i];
@@ -164,22 +192,20 @@ std::vector<io::Item> load_items(void* current) {
     // or we can create a new aligned.
     if (item.type == Type::ig8) {
       // since Embedding layer quantized weights need to be dequantised, we
-      // have a special case for items containing the name "Wemb"
-      if (item.name == "Wemb_QuantMultA") {
-        // Wemb_QuantMultA hints at this being the quantization multiplier for
-        // when we have to process at linear multiply on embedding.  However,
-        // this value does not hold anything useful.
-
-        // It is `none_QuantMultA` of type `float32` that holds the useful
-        // quantization multiplier.
-
+      // have a special case for the embedding tensors. Two-vocab models
+      // (en-zh, en-ja, ...) have separate `encoder_Wemb` / `decoder_Wemb`;
+      // single-vocab models have a single `Wemb`. The handling is the same:
+      // unquantize the int8 storage to float for embedding lookup, and (for
+      // the embedding that doubles as the decoder output projection) also
+      // produce a PrepareB-prepared int8 alias for the GEMM.
+      if (is_quant_mult_a_marker(item.name)) {
         // Pointing to this, that's all, mostly a no-op and prevents falling
         // into the other branch.
         item.view = View{
             .data = ptr,  //
             .size = size  //
         };
-      } else if (item.name == "Wemb") {  // NOLINT
+      } else if (is_embedding_name(item.name)) {  // NOLINT
         size_t num_elements = item.shape.elements();
         // At the end of items is the quantization multiplier.So we do some
         // pointer arithmetic to move ahead of the elements to extract the
@@ -203,25 +229,47 @@ std::vector<io::Item> load_items(void* current) {
         size_t cols = item.shape.dim(-1);
         assert((rows * cols) % 8 == 0);
 
-        // PrepareB and write.
-        embedding_processed.name = "Wemb_intgemm8";
-        embedding_processed.shape = Shape({cols, rows});
-        embedding_processed.type = Type::i8;
-        size_t prepared_size =
-            embedding_processed.shape.elements() * sizeof(int8_t) +
-            sizeof(float);
-        Aligned embedding_aligned(kAlignWidth, prepared_size);
-        auto* prepared = reinterpret_cast<int8_t*>(embedding_aligned.data());
-        qmm::prepare_weight_transposed(weights, prepared,
-                                       quantization_multiplier, cols, rows);
+        // Decide which name the PrepareB-form alias should take. Skip the
+        // alias entirely for `encoder_Wemb` — encoder embeddings are never
+        // used as a GEMM B-matrix. For `decoder_Wemb` and the legacy single
+        // `Wemb`, build the int8 alias for the decoder output projection.
+        const bool needs_prepared_alias = (item.name != "encoder_Wemb");
+        if (needs_prepared_alias) {
+          Item& processed = (item.name == "decoder_Wemb")
+                                ? decoder_embedding_processed
+                                : embedding_processed;
+          processed.name = (item.name == "decoder_Wemb")
+                               ? "decoder_Wemb_intgemm8"
+                               : "Wemb_intgemm8";
+          processed.shape = Shape({cols, rows});
+          processed.type = Type::i8;
+          size_t prepared_size =
+              processed.shape.elements() * sizeof(int8_t) + sizeof(float);
+          Aligned embedding_aligned(kAlignWidth, prepared_size);
+          auto* prepared = reinterpret_cast<int8_t*>(embedding_aligned.data());
+          qmm::prepare_weight_transposed(weights, prepared,
+                                         quantization_multiplier, cols, rows);
 
-        // Save quantization multiplier.
-        auto* embedding_quantization_multiplier_addr =
-            reinterpret_cast<float*>(prepared + (rows * cols));
-        *embedding_quantization_multiplier_addr = quantization_multiplier;
+          auto* embedding_quantization_multiplier_addr =
+              reinterpret_cast<float*>(prepared + (rows * cols));
+          *embedding_quantization_multiplier_addr = quantization_multiplier;
 
-        // SLIMT_TRACE(embedding_processed.shape);
-        set_item(embedding_processed, std::move(embedding_aligned));
+          set_item(processed, std::move(embedding_aligned));
+
+          // For two-vocab models the file has no separate `none_QuantMultA`
+          // item, but the decoder output projection's quant tensor still
+          // needs to be filled. Synthesize one carrying the multiplier we
+          // just extracted.
+          if (item.name == "decoder_Wemb") {
+            synthesized_none_quant_mult_a.name = "none_QuantMultA";
+            synthesized_none_quant_mult_a.shape = Shape({1});
+            synthesized_none_quant_mult_a.type = Type::f32;
+            Aligned quant_aligned(kAlignWidth, sizeof(float));
+            *reinterpret_cast<float*>(quant_aligned.data()) =
+                quantization_multiplier;
+            set_item(synthesized_none_quant_mult_a, std::move(quant_aligned));
+          }
+        }
       } else {
         // The matrix has to be processed to the format expected by intgemm.
         size_t rows = item.shape.dim(-2);
@@ -268,7 +316,12 @@ std::vector<io::Item> load_items(void* current) {
     }
   }
 
+  // Append both prepared aliases. Items left default-constructed (e.g. when
+  // the model has no `decoder_Wemb`) appear as no-name entries that the
+  // Transformer's parameter map never looks up — harmless.
   items.push_back(std::move(embedding_processed));
+  items.push_back(std::move(decoder_embedding_processed));
+  items.push_back(std::move(synthesized_none_quant_mult_a));
   return items;
 }
 

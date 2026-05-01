@@ -105,7 +105,8 @@ Transformer::Transformer(size_t encoder_layers, size_t decoder_layers,
                          View model)
     : items_(io::load_items(model.data)),
       encoder_(encoder_layers, num_heads, feed_forward_depth),  //
-      decoder_(decoder_layers, num_heads, feed_forward_depth, embedding_) {
+      decoder_(decoder_layers, num_heads, feed_forward_depth,
+               decoder_embedding_) {
   load_parameters();
   prepare_biases();
 }
@@ -125,8 +126,15 @@ void Decoder::register_parameters(const std::string &prefix,
   // https://github.com/browsermt/marian-dev/blob/2be8344fcf2776fb43a7376284067164674cbfaf/scripts/alphas/extract_stats.py#L55
   // - none_QuantMultA is generated when used with shortlist
   // - Wemb_QuantMultA is generated when used without shortlist.
+  //
+  // For shared-vocab models the output projection's W tensor is the
+  // PrepareB-form alias of `Wemb`, named `Wemb_intgemm8`. For two-vocab
+  // models it's the alias of `decoder_Wemb`, named `decoder_Wemb_intgemm8`.
+  // Register both — Io.cc only emits whichever matches the model file.
   parameters.emplace("Wemb_intgemm8", &output_.W);
+  parameters.emplace("decoder_Wemb_intgemm8", &output_.W);
   parameters.emplace("none_QuantMultA", &output_.quant);
+  parameters.emplace("decoder_Wemb_QuantMultA", &output_.quant);
   parameters.emplace("decoder_ff_logit_out_b", &output_.b);
 
   for (DecoderLayer &layer : decoder_) {
@@ -230,20 +238,50 @@ void Transformer::load_parameters() {
   };
 
   std::vector<std::string> missed;
+  bool loaded_shared_wemb = false;
   for (io::Item &item : items_) {
+    if (item.name.empty()) continue;  // placeholder slots from Io.cc
     Tensor *target = lookup(item.name);
     if (target) {
       target->load(item.view, item.type, item.shape, item.name);
+      // For shared-vocab models the single `Wemb` (and its `Wemb_intgemm8`
+      // alias) covers both encoder input embedding and the decoder's
+      // input/output projection. The Decoder holds a reference to
+      // `decoder_embedding_`; mirror the encoder copy into it below.
+      if (item.name == "Wemb") loaded_shared_wemb = true;
       parameters.erase(item.name);
     } else {
       missed.push_back(item.name);
     }
   }
 
+  // Shared-vocab fallback: copy the loaded `Wemb` into `decoder_embedding_`
+  // so Decoder::step reads the same data through its reference. Two-vocab
+  // models populate `decoder_embedding_` directly from `decoder_Wemb` and
+  // never need this copy.
+  if (loaded_shared_wemb) {
+    decoder_embedding_.load(encoder_embedding_.view(), encoder_embedding_.type(),
+                            encoder_embedding_.shape(),
+                            encoder_embedding_.name());
+    // The decoder side's parameter slots for `decoder_Wemb*` legitimately
+    // didn't load from this model file — drop them from `missed`/`parameters`
+    // accounting.
+    parameters.erase("decoder_Wemb");
+  }
+
   for (std::string &entry : missed) {
     std::cerr << "[warn] Failed to ingest expected load of " << entry << "\n";
   }
   for (auto &parameter : parameters) {
+    // Embedding-related slots are intentionally over-registered (Wemb,
+    // encoder_Wemb, decoder_Wemb) — at most one set of names matches any
+    // given model file. Suppress the warning for the unmatched ones.
+    const std::string &name = parameter.first;
+    if (name == "Wemb" || name == "encoder_Wemb" || name == "decoder_Wemb" ||
+        name == "Wemb_intgemm8" || name == "decoder_Wemb_intgemm8" ||
+        name == "decoder_Wemb_QuantMultA") {
+      continue;
+    }
     std::cerr << "[warn] Failed to complete expected load of ";
     std::cerr << parameter.first << "\n";
   }
@@ -251,7 +289,18 @@ void Transformer::load_parameters() {
 
 void Transformer::register_parameters(const std::string &prefix,
                                       ParameterMap &parameters) {
-  parameters.emplace("Wemb", &embedding_);
+  // Shared-vocab models (the bergamot tiny11 baseline) ship a single `Wemb`
+  // that the encoder reads as input embedding AND the decoder reuses as
+  // input lookup + output projection. Two-vocab models (en-zh, en-ja, ...)
+  // ship separate `encoder_Wemb` and `decoder_Wemb` tensors of different
+  // sizes. Register all three names; Io.cc + Transformer::load_parameters
+  // populate whichever the model file actually contains. For shared-vocab
+  // models the `Wemb` ingest path here populates `encoder_embedding_`, and
+  // a post-load step copies it into `decoder_embedding_` so Decoder::step
+  // (which holds a reference to decoder_embedding_) sees the same data.
+  parameters.emplace("Wemb", &encoder_embedding_);
+  parameters.emplace("encoder_Wemb", &encoder_embedding_);
+  parameters.emplace("decoder_Wemb", &decoder_embedding_);
   encoder_.register_parameters(prefix, parameters);
   decoder_.register_parameters(prefix, parameters);
 }
