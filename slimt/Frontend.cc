@@ -217,10 +217,30 @@ Async::Async(const Config &config)
       std::tie(batch, model) = batcher_.generate();
       while (!batch.empty()) {
         // convert between batches.
-        Input input = convert(batch, model->vocabulary().pad_id(),
-                              config_.tgt_length_limit_factor);
-        Histories histories = model->forward(input);
-        batch.complete(histories);
+        try {
+          Input input = convert(batch, model->vocabulary().pad_id(),
+                                config_.tgt_length_limit_factor);
+          Histories histories = model->forward(input);
+          batch.complete(histories);
+        } catch (const std::exception& e) {
+          // A SLIMT_ABORT*-throw, a sentencepiece/vocab error, or any other
+          // exception from convert/forward/complete must NOT kill the worker
+          // thread (which would terminate the whole process). Fulfill the
+          // in-flight Requests with empty Histories so their futures unblock
+          // with an empty Response on the calling thread, then keep serving.
+          std::cerr << "[slimt] worker caught: " << e.what() << '\n';
+          try {
+            Histories empties(batch.size());
+            for (auto& h : empties) {
+              h = std::make_shared<Hypothesis>();
+            }
+            batch.complete(empties);
+          } catch (...) {
+            // If even the empty-completion path throws, skip the batch —
+            // the corresponding futures will be lost, but the worker stays
+            // alive to serve future requests.
+          }
+        }
         // Release the batch (which holds Ptr<Request>) and the model before
         // re-entering the blocking generate() call. Otherwise an idle worker
         // pins the most recently used model alive — preventing eviction from
