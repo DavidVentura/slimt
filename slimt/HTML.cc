@@ -449,9 +449,17 @@ HTML::HTML(std::string &source, Options &&options)
       case markup::Scanner::TT_TAG_START: {
         std::string name = to_lower_case(scanner.tag());
 
+        // SGML declarations (<!DOCTYPE …>, <![CDATA[ … ]]>, etc.) start with
+        // '!' and have no matching closing tag. The void-tag list doesn't
+        // catch them, so treat any leading-'!' name as void to avoid the
+        // "Not all tags were closed: <!DOCTYPE html>" abort on real-world
+        // HTML.
+        bool is_sgml_decl = !name.empty() && name[0] == '!';
+
         // Tag *tag is used by attribute parsing
-        auto type = contains(options_.void_tags, name) ? Tag::VOID_ELEMENT
-                                                       : Tag::ELEMENT;
+        auto type = (is_sgml_decl || contains(options_.void_tags, name))
+                        ? Tag::VOID_ELEMENT
+                        : Tag::ELEMENT;
         tag = make_tag({.type = type, .name = std::string(scanner.tag())});
 
         stack.push_back(tag);
