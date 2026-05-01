@@ -101,6 +101,14 @@ class Batcher {
   // Removes any pending requests from the pool.
   void clear();
 
+  // True iff there are no pending sentences in any bucket.
+  bool empty() const {
+    for (const auto& b : bucket_) {
+      if (!b.empty()) return false;
+    }
+    return true;
+  }
+
  private:
   size_t max_words_;
   std::vector<std::set<SegmentRef>> bucket_;

@@ -212,16 +212,23 @@ Async::Async(const Config &config)
   // Also creates consumers, starts listening.
   for (size_t i = 0; i < config.workers; i++) {
     workers_.emplace_back([this]() {
-      auto [batch, model] = batcher_.generate();
+      Batch batch;
+      Ptr<Model> model;
+      std::tie(batch, model) = batcher_.generate();
       while (!batch.empty()) {
         // convert between batches.
         Input input = convert(batch, model->vocabulary().pad_id(),
                               config_.tgt_length_limit_factor);
         Histories histories = model->forward(input);
         batch.complete(histories);
-        auto [next_batch, next_model] = batcher_.generate();
-        batch = std::move(next_batch);
-        model = std::move(next_model);
+        // Release the batch (which holds Ptr<Request>) and the model before
+        // re-entering the blocking generate() call. Otherwise an idle worker
+        // pins the most recently used model alive — preventing eviction from
+        // releasing the underlying mmap until either the service shuts down or
+        // another translate request happens to swap this worker's model.
+        batch = Batch();
+        model.reset();
+        std::tie(batch, model) = batcher_.generate();
       }
     });
   }
