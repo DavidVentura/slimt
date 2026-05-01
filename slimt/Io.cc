@@ -203,8 +203,8 @@ std::vector<io::Item> load_items(void* current) {
         // Pointing to this, that's all, mostly a no-op and prevents falling
         // into the other branch.
         item.view = View{
-            .data = ptr,  //
-            .size = size  //
+            .data = ptr,                       //
+            .size = static_cast<size_t>(size)  //
         };
       } else if (is_embedding_name(item.name)) {  // NOLINT
         size_t num_elements = item.shape.elements();
@@ -294,8 +294,8 @@ std::vector<io::Item> load_items(void* current) {
         auto debug = [&]() {
           Tensor input_view;
           View original = {
-              .data = ptr,                    //
-              .size = headers[i].data_length  //
+              .data = ptr,                                         //
+              .size = static_cast<size_t>(headers[i].data_length)  //
           };
 
           input_view.load(original, item.type, item.shape, item.name);
@@ -311,8 +311,8 @@ std::vector<io::Item> load_items(void* current) {
       }
     } else {
       item.view = View{
-          .data = ptr,  //
-          .size = size  //
+          .data = ptr,                       //
+          .size = static_cast<size_t>(size)  //
       };
     }
   }
