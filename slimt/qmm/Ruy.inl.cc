@@ -87,6 +87,16 @@ Tensor affine<Provider::Ruy>(const Tensor& x, const Tensor& W, const Tensor& b,
   ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
                         rhs.mutable_layout());
   rhs.set_data(W.data<int8_t>());
+  // Cache the RHS pack only when W's data pointer is model-lifetime stable.
+  // Mmap-backed model weights satisfy this (Tensor::load takes a View,
+  // never owns/frees the buffer — `standalone() == false`). Heap-owned
+  // tensors (e.g. SelectedAffine.W from select_columns) get freed at
+  // decode end; their address can be reused by the next decode's allocator
+  // call, and Ruy's pointer-keyed cache would then return a stale pack
+  // (garbage logits) plus grow unboundedly across decodes (OOM).
+  if (!W.standalone()) {
+    rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
+  }
 
   // PrepareBias: ?
   // Actualyl there is no need.
@@ -170,6 +180,7 @@ Tensor dot<Provider::Ruy>(const Tensor& x, const Tensor& W, float a_quant,
   ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
                         rhs.mutable_layout());
   rhs.set_data(W.data<int8_t>());
+  rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
 
   // PrepareBias: ?
   // Actualyl there is no need.

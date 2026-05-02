@@ -518,6 +518,11 @@ inline void matrix_multiply<Provider::Ruy>(  //
   ruy::Matrix<float> rhs;
   ruy::MakeSimpleLayout(K, N, orderB, rhs.mutable_layout());
   rhs.set_data(B);
+  // No pack-caching here: B in this path is SDPA's K/V (heap-allocated per
+  // decode and freed at decode end). Ruy keys its prepacked cache on the
+  // src data pointer, so a freed-and-reallocated buffer at the same heap
+  // address would silently return a stale pack, producing garbage logits.
+  // Only `affine<Ruy>` (where RHS is a model-lifetime weight) caches.
 
   ruy::Matrix<float> dst;
   ruy::MakeSimpleLayout(M, N, ruy::Order::kRowMajor, dst.mutable_layout());
