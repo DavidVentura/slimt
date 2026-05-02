@@ -36,18 +36,6 @@ Tensor affine_with_prepared_bias(const Tensor& x, const Tensor& W,
                                  const std::string& name = "");
 
 template <enum Provider>
-Tensor affine_with_select(const Tensor& x, const Tensor& W, const Tensor& b,
-                          float a_quant, float b_quant,
-                          const std::vector<uint32_t>& indices,
-                          const std::string& name = "");
-
-template <enum Provider>
-Tensor affine_with_select_prepared_bias(
-    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
-    float a_quant, float b_quant, const std::vector<uint32_t>& indices,
-    const std::string& name = "");
-
-template <enum Provider>
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name = "");
 
@@ -75,16 +63,6 @@ Tensor affine_with_prepared_bias(const Tensor& x, const Tensor& W,
                                  const Tensor& prepared_bias, float a_quant,
                                  float b_quant,
                                  const std::string& name = "");
-
-Tensor affine_with_select(const Tensor& x, const Tensor& W, const Tensor& b,
-                          float a_quant, float b_quant,
-                          const std::vector<uint32_t>& indices,
-                          const std::string& name = "");
-
-Tensor affine_with_select_prepared_bias(
-    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
-    float a_quant, float b_quant, const std::vector<uint32_t>& indices,
-    const std::string& name = "");
 
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name = "");

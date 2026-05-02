@@ -23,8 +23,8 @@ struct Affine {
 // Snapshot of an Affine restricted to a fixed set of output columns
 // (a "shortlist"). Built once per decode in Model::decode and reused across
 // every decoder step, so the per-step output projection skips both the
-// column-selection and bias-gather work that the unselected
-// `affine_with_select_prepared_bias` would redo on every call.
+// column-selection (via `qmm::select_columns`) and the bias gather that
+// would otherwise run inside every per-step call.
 struct SelectedAffine {
   Tensor W;
   Tensor prepared_bias;

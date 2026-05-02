@@ -235,11 +235,8 @@ std::tuple<Tensor, Tensor> Decoder::step(
   // position (`startPos`) at every step. Using start=0 here makes greedy
   // decoding repeat tokens (e.g. "Hello, Hello, Hello") because every step
   // sees the same position signal.
-  if (step_index < kMaxCachedPositions) {
-    transform_embedding(decoder_embed, positions_, step_index);
-  } else {
-    transform_embedding(decoder_embed, step_index);
-  }
+  assert(step_index < kMaxCachedPositions);
+  transform_embedding(decoder_embed, positions_, step_index);
 
   auto [x, attn] =
       decoder_[0].forward(contexts[0], mask, states[0], decoder_embed);

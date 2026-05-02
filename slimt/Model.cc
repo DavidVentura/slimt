@@ -205,9 +205,6 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   std::vector<bool> complete(batch_size, false);
   const Vocabulary &target_vocab = target_vocabulary();
   uint32_t eos = target_vocab.eos_id();
-  // Bisect: reverted to the original shape (returns absolute remaining
-  // count, computed by scanning `complete` post-loop) to test whether the
-  // delta-based rewrite was the source of the +0.36% perfstat regression.
   auto record = [eos, &complete](const std::vector<size_t> &active_to_original,
                                  Words &step, Sentences &sentences) {
     size_t finished = 0;

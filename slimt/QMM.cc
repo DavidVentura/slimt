@@ -57,26 +57,6 @@ Tensor affine_with_prepared_bias(const Tensor& x, const Tensor& W,
                                               b_quant, name);
 }
 
-Tensor affine_with_select(const Tensor& x, const Tensor& W, const Tensor& b,
-                          float a_quant, float b_quant,
-                          const std::vector<uint32_t>& indices,
-                          const std::string& name) {
-  using detail::affine_with_select;
-  using detail::kProvider;
-  return affine_with_select<kProvider>(x, W, b, a_quant, b_quant, indices,
-                                       name);
-}
-
-Tensor affine_with_select_prepared_bias(
-    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
-    float a_quant, float b_quant, const std::vector<uint32_t>& indices,
-    const std::string& name) {
-  using detail::affine_with_select_prepared_bias;
-  using detail::kProvider;
-  return affine_with_select_prepared_bias<kProvider>(
-      x, W, prepared_bias, a_quant, b_quant, indices, name);
-}
-
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name) {
   using detail::kProvider;
