@@ -49,9 +49,18 @@ class Decoder {
                                   size_t step_index = 0) const;
 
  private:
+  // Number of positions for which the sinusoidal table is precomputed at
+  // model load. Bergamot ships with `wrap_length=128` and
+  // `tgt_length_limit_factor=1.5`, giving practical decode lengths under
+  // ~200; 1024 covers every realistic configuration. Decodes that somehow
+  // exceed this fall back to the per-step `sinusoidal_signal` path.
+  // Memory cost: kMaxCachedPositions × embed_dim × sizeof(float) per model.
+  static constexpr size_t kMaxCachedPositions = 1024;
+
   const Tensor &embedding_;
   std::vector<DecoderLayer> decoder_;
   Affine output_;
+  Tensor positions_;
 };
 
 class Vocabulary;
@@ -63,6 +72,8 @@ Words greedy_sample_from_words(const Tensor &logits,
                                size_t batch_size);
 
 void transform_embedding(Tensor &word_embedding, size_t start = 0);
+void transform_embedding(Tensor &word_embedding, const Tensor &positions,
+                         size_t start = 0);
 
 class Transformer {
  public:

@@ -1,5 +1,7 @@
 #include "slimt/Transformer.hh"
 
+#include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +44,28 @@ void transform_embedding(Tensor &word_embedding, size_t start /* = 0*/) {
                     positional_embedding_ptr);
 
   // https://github.com/browsermt/marian-dev/blob/14c9d9b0e732f42674e41ee138571d5a7bf7ad94/src/models/transformer.h#L109
+  add_positional_embedding(word_embedding_ptr, positional_embedding_ptr,
+                           batch_size, sequence_length, embed_dim,
+                           word_embedding_ptr);
+}
+
+// Variant that reads from a precomputed sinusoidal table instead of running
+// `sinusoidal_signal` every step. The table is owned by the Decoder and
+// populated once at model load.
+void transform_embedding(Tensor &word_embedding, const Tensor &positions,
+                         size_t start /* = 0*/) {
+  uint64_t embed_dim = word_embedding.dim(-1);
+  uint64_t sequence_length = word_embedding.dim(-2);
+  uint64_t batch_size = word_embedding.dim(-3);
+  assert(positions.dim(-1) == embed_dim);
+  assert(start + sequence_length <= positions.dim(-2));
+
+  auto *word_embedding_ptr = word_embedding.data<float>();
+  mul_scalar(word_embedding_ptr, std::sqrt(static_cast<float>(embed_dim)),
+             word_embedding.size(), word_embedding_ptr);
+
+  const float *positional_embedding_ptr =
+      positions.data<float>() + start * embed_dim;
   add_positional_embedding(word_embedding_ptr, positional_embedding_ptr,
                            batch_size, sequence_length, embed_dim,
                            word_embedding_ptr);
@@ -146,6 +170,17 @@ void Decoder::prepare_biases() {
   for (DecoderLayer &layer : decoder_) {
     layer.prepare_biases();
   }
+
+  // Precompute the sinusoidal positional table once. `embedding_` has been
+  // populated by load_parameters() (called before prepare_biases() in
+  // Transformer::Transformer), so embed_dim is known here. The Decoder is
+  // const after this — every Model::decode reads the same buffer with no
+  // synchronization, and step() avoids the per-step alloc + transcendentals.
+  size_t embed_dim = embedding_.dim(-1);
+  positions_ = Tensor(Type::f32, Shape({kMaxCachedPositions, embed_dim}),
+                      "decoder_positions");
+  sinusoidal_signal(0, kMaxCachedPositions, embed_dim,
+                    positions_.data<float>());
 }
 
 SelectedAffine Decoder::prepare_shortlisted_output(
@@ -182,15 +217,16 @@ std::tuple<Tensor, Tensor> Decoder::step(
     }
 
     size_t sequence_length = 1;
-    Shape shape({batch_size, sequence_length});
-    // Maybe move this to some new construct?
-    Tensor indices(Type::i32, std::move(shape), name);
-    int *data = indices.data<int>();
+    Shape shape({batch_size, sequence_length, embed_dim});
+    Tensor embedding(Type::f32, std::move(shape), name);
+    const float *source = embedding_.data<float>();
+    float *target = embedding.data<float>();
     for (size_t batch_id = 0; batch_id < batch_size; batch_id++) {
-      data[batch_id] = previous_step[batch_id];
+      size_t token = previous_step[batch_id];
+      const float *row = source + token * embed_dim;
+      std::copy(row, row + embed_dim, target + batch_id * embed_dim);
     }
 
-    Tensor embedding = index_select(embedding_, indices);
     return embedding;
   };
 
@@ -199,7 +235,11 @@ std::tuple<Tensor, Tensor> Decoder::step(
   // position (`startPos`) at every step. Using start=0 here makes greedy
   // decoding repeat tokens (e.g. "Hello, Hello, Hello") because every step
   // sees the same position signal.
-  transform_embedding(decoder_embed, step_index);
+  if (step_index < kMaxCachedPositions) {
+    transform_embedding(decoder_embed, positions_, step_index);
+  } else {
+    transform_embedding(decoder_embed, step_index);
+  }
 
   auto [x, attn] =
       decoder_[0].forward(contexts[0], mask, states[0], decoder_embed);
@@ -367,6 +407,7 @@ void topk_inspect_with_words(size_t batch_id, const Vocabulary &vocabulary,
 Words greedy_sample(const Tensor &logits, const Vocabulary &vocabulary,
                     size_t batch_size) {
   Words sampled_words;
+  sampled_words.reserve(batch_size);
   size_t stride = vocabulary.size();
   const auto *data = logits.data<float>();
   for (size_t i = 0; i < batch_size; i++) {
@@ -387,6 +428,7 @@ Words greedy_sample_from_words(const Tensor &logits,
   (void)vocabulary;
   size_t stride = words.size();
   Words sampled_words;
+  sampled_words.reserve(batch_size);
   const auto *data = logits.data<float>();
   for (size_t i = 0; i < batch_size; i++) {
     size_t max_index = argmax(data + i * stride, stride);

@@ -205,6 +205,9 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   std::vector<bool> complete(batch_size, false);
   const Vocabulary &target_vocab = target_vocabulary();
   uint32_t eos = target_vocab.eos_id();
+  // Bisect: reverted to the original shape (returns absolute remaining
+  // count, computed by scanning `complete` post-loop) to test whether the
+  // delta-based rewrite was the source of the +0.36% perfstat regression.
   auto record = [eos, &complete](const std::vector<size_t> &active_to_original,
                                  Words &step, Sentences &sentences) {
     size_t finished = 0;
@@ -246,26 +249,7 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   // outputs from compact) happen outside arena scopes.
   constexpr size_t kArenaInitialBytes = 8 << 20;  // 8 MiB
   Arena arena(kArenaInitialBytes);
-
-  size_t remaining;
-  {
-    ArenaScope arena_scope(arena);
-    auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
-                                       states, contexts, previous_slice,
-                                       shortlisted_output_ptr,
-                                       /*step_index=*/0);
-
-    if (indices) {
-      previous_slice = greedy_sample_from_words(logits, target_vocab, *indices,
-                                                batch_size);
-    } else {
-      previous_slice = greedy_sample(logits, target_vocab, batch_size);
-    }
-
-    update_alignment(active_to_original, input.lengths(), complete, attn,
-                     alignments);
-    remaining = record(active_to_original, previous_slice, sentences);
-  }
+  size_t max_seq_length = input.limit_factor() * source_sequence_length;
 
   auto compact = [&]() {
     std::vector<size_t> keep;
@@ -303,9 +287,28 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
     contexts = select_batch(contexts, keep);
     active_to_original = std::move(next_active_to_original);
   };
+
+  size_t remaining;
+  {
+    ArenaScope arena_scope(arena);
+    auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
+                                       states, contexts, previous_slice,
+                                       shortlisted_output_ptr,
+                                       /*step_index=*/0);
+
+    if (indices) {
+      previous_slice = greedy_sample_from_words(logits, target_vocab, *indices,
+                                                batch_size);
+    } else {
+      previous_slice = greedy_sample(logits, target_vocab, batch_size);
+    }
+
+    update_alignment(active_to_original, input.lengths(), complete, attn,
+                     alignments);
+    remaining = record(active_to_original, previous_slice, sentences);
+  }
   compact();
 
-  size_t max_seq_length = input.limit_factor() * source_sequence_length;
   size_t steps = 1;
   for (size_t i = 1; i < max_seq_length && remaining > 0; i++) {
     arena.reset();
