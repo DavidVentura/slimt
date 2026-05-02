@@ -152,7 +152,8 @@ void Decoder::prepare_biases() {
 std::tuple<Tensor, Tensor> Decoder::step(
     const Tensor &encoder_out, const Tensor &mask, std::vector<Tensor> &states,
     const std::vector<AttentionContext> &contexts,
-    const Words &previous_step, const std::optional<Words> &shortlist) const {
+    const Words &previous_step, const std::optional<Words> &shortlist,
+    size_t step_index) const {
   // Infer batch-size from encoder_out.
   size_t encoder_feature_dim = encoder_out.dim(-1);
   size_t source_sequence_length = encoder_out.dim(-2);
@@ -190,7 +191,11 @@ std::tuple<Tensor, Tensor> Decoder::step(
   };
 
   Tensor decoder_embed = from_sentences(previous_step, batch_size);
-  transform_embedding(decoder_embed);
+  // Marian's transformer.h adds positional encoding for the absolute decoder
+  // position (`startPos`) at every step. Using start=0 here makes greedy
+  // decoding repeat tokens (e.g. "Hello, Hello, Hello") because every step
+  // sees the same position signal.
+  transform_embedding(decoder_embed, step_index);
 
   auto [x, attn] =
       decoder_[0].forward(contexts[0], mask, states[0], decoder_embed);

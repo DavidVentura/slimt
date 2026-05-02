@@ -39,7 +39,8 @@ class Decoder {
                                   std::vector<Tensor> &states,
                                   const std::vector<AttentionContext> &contexts,
                                   const Words &previous_step,
-                                  const std::optional<Words> &shortlist) const;
+                                  const std::optional<Words> &shortlist,
+                                  size_t step_index = 0) const;
 
  private:
   const Tensor &embedding_;

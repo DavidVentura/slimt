@@ -240,7 +240,7 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
     ArenaScope arena_scope(arena);
     auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
                                        states, contexts, previous_slice,
-                                       indices);
+                                       indices, /*step_index=*/0);
 
     if (indices) {
       previous_slice = greedy_sample_from_words(logits, target_vocab, *indices,
@@ -301,7 +301,7 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
       ArenaScope arena_scope(arena);
       auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
                                          states, contexts, previous_slice,
-                                         indices);
+                                         indices, /*step_index=*/i);
       steps++;
       if (indices) {
         previous_slice =
