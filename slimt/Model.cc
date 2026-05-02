@@ -189,6 +189,19 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   // std::vector<uint32_t> indices(target_vocab.size());
   // std::iota(indices.begin(), indices.end(), 0);
 
+  // Lift the shortlisted output projection out of the per-step path. The
+  // shortlist is fixed for the whole decode, so the column-select on `W` and
+  // the matching gather on `prepared_bias` only need to run once. Built
+  // before the ArenaScope so the underlying tensors heap-allocate and
+  // survive across step iterations.
+  std::optional<SelectedAffine> shortlisted_output;
+  if (indices) {
+    shortlisted_output =
+        transformer_.decoder().prepare_shortlisted_output(*indices);
+  }
+  const SelectedAffine *shortlisted_output_ptr =
+      shortlisted_output ? &*shortlisted_output : nullptr;
+
   std::vector<bool> complete(batch_size, false);
   const Vocabulary &target_vocab = target_vocabulary();
   uint32_t eos = target_vocab.eos_id();
@@ -239,7 +252,8 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
     ArenaScope arena_scope(arena);
     auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
                                        states, contexts, previous_slice,
-                                       indices, /*step_index=*/0);
+                                       shortlisted_output_ptr,
+                                       /*step_index=*/0);
 
     if (indices) {
       previous_slice = greedy_sample_from_words(logits, target_vocab, *indices,
@@ -300,7 +314,8 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
       ArenaScope arena_scope(arena);
       auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
                                          states, contexts, previous_slice,
-                                         indices, /*step_index=*/i);
+                                         shortlisted_output_ptr,
+                                         /*step_index=*/i);
       steps++;
       if (indices) {
         previous_slice =

@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
-#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -149,10 +148,15 @@ void Decoder::prepare_biases() {
   }
 }
 
+SelectedAffine Decoder::prepare_shortlisted_output(
+    const Words &shortlist) const {
+  return prepare_selected(output_, shortlist);
+}
+
 std::tuple<Tensor, Tensor> Decoder::step(
     const Tensor &encoder_out, const Tensor &mask, std::vector<Tensor> &states,
     const std::vector<AttentionContext> &contexts,
-    const Words &previous_step, const std::optional<Words> &shortlist,
+    const Words &previous_step, const SelectedAffine *shortlisted_output,
     size_t step_index) const {
   // Infer batch-size from encoder_out.
   size_t encoder_feature_dim = encoder_out.dim(-1);
@@ -211,8 +215,8 @@ std::tuple<Tensor, Tensor> Decoder::step(
     }
   }
 
-  if (shortlist) {
-    Tensor logits = affine_with_select(output_, x, *shortlist, "logits");
+  if (shortlisted_output) {
+    Tensor logits = affine_with_selected(*shortlisted_output, x, "logits");
     return {std::move(logits), std::move(guided_alignment)};
   }
 

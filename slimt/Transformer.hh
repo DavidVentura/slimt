@@ -1,6 +1,5 @@
 #pragma once
 #include <cstddef>
-#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -35,11 +34,18 @@ class Decoder {
   std::vector<AttentionContext> prepare_contexts(
       const Tensor &encoder_out) const;
   std::vector<Tensor> start_states(size_t batch_size) const;
+
+  // Pre-compute the shortlisted output projection (selected columns of `W`
+  // and the matching slice of `prepared_bias`) once for the whole decode.
+  // The returned snapshot is fed back into `step` on every iteration so the
+  // per-step path skips column-selection / bias-gather entirely.
+  SelectedAffine prepare_shortlisted_output(const Words &shortlist) const;
+
   std::tuple<Tensor, Tensor> step(const Tensor &encoder_out, const Tensor &mask,
                                   std::vector<Tensor> &states,
                                   const std::vector<AttentionContext> &contexts,
                                   const Words &previous_step,
-                                  const std::optional<Words> &shortlist,
+                                  const SelectedAffine *shortlisted_output,
                                   size_t step_index = 0) const;
 
  private:

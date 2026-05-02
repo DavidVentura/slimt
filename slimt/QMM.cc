@@ -77,6 +77,13 @@ Tensor affine_with_select_prepared_bias(
       x, W, prepared_bias, a_quant, b_quant, indices, name);
 }
 
+Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
+                      const std::string& name) {
+  using detail::kProvider;
+  using detail::select_columns;
+  return select_columns<kProvider>(W, indices, name);
+}
+
 Tensor dot(const Tensor& x, const Tensor& W, float a_quant, float b_quant,
            const std::string& name) {
   using detail::dot;

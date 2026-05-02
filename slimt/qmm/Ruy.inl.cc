@@ -116,6 +116,30 @@ Tensor affine<Provider::Ruy>(const Tensor& x, const Tensor& W, const Tensor& b,
 }
 
 template <>
+Tensor select_columns<Provider::Ruy>(const Tensor& W,
+                                     const std::vector<uint32_t>& indices,
+                                     const std::string& name) {
+  // B is stored col-major as `width × cols`, so each output column lives in a
+  // contiguous `width`-byte slab. Memcpy the requested columns into a fresh
+  // `width × |indices|` block; the result has the same layout, so any
+  // downstream affine call can treat it as a normal weight tensor.
+  const Tensor& B = W;                // NOLINT
+  size_t B_cols = B.dim(-1);          // NOLINT
+  size_t B_rows = B.size() / B_cols;  // NOLINT
+  size_t width = B_rows;
+
+  Tensor selected_B(Type::i8, Shape({width, indices.size()}),  // NOLINT
+                    name.empty() ? "selected_B" : name);
+
+  const auto* B_data = B.data<int8_t>();      // NOLINT
+  auto* sB_data = selected_B.data<int8_t>();  // NOLINT
+  for (size_t c = 0; c < indices.size(); ++c) {
+    std::memcpy(&sB_data[c * width], &B_data[indices[c] * width], width);
+  }
+  return selected_B;
+}
+
+template <>
 Tensor affine_with_select<Provider::Ruy>(const Tensor& x, const Tensor& W,
                                          const Tensor& b, float a_quant,
                                          float b_quant,

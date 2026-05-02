@@ -188,33 +188,36 @@ Tensor affine(const Affine &parameters, const Tensor &x,
   return y;
 }
 
-Tensor affine_with_select(const Affine &parameters, const Tensor &x,
-                          const std::vector<uint32_t> &indices,
-                          const std::string &name /*= ""*/) {
-  Tensor local_prepared_bias;
-  const Tensor *prepared_bias = nullptr;
-  if (parameters.prepared_bias_ready) {
-    prepared_bias = &retrieve_prepared_bias(parameters);
-  } else {
-    local_prepared_bias = qmm::prepare_bias(             //
-        parameters.W, parameters.b,                      //
-        parameters.quant.item<float>(),                  //
-        retrieve_quantization_multiplier(parameters.W),  //
-        "prepared_bias"                                  //
-    );
-    prepared_bias = &local_prepared_bias;
+SelectedAffine prepare_selected(const Affine &parameters,
+                                const std::vector<uint32_t> &indices) {
+  // Caller is expected to have run prepare_bias on the Affine at load time —
+  // shortlisting is only worthwhile when we're amortizing this across many
+  // decoder steps, and that path always goes through prepare_biases() first.
+  assert(parameters.prepared_bias_ready);
+
+  Tensor selected_W = qmm::select_columns(parameters.W, indices, "selected_W");
+
+  Tensor selected_prepared_bias(Type::f32, Shape({indices.size()}),
+                                "selected_prepared_bias");
+  const float *src = parameters.prepared_bias.data<float>();
+  float *dst = selected_prepared_bias.data<float>();
+  for (size_t i = 0; i < indices.size(); ++i) {
+    dst[i] = src[indices[i]];
   }
 
-  Tensor y = qmm::affine_with_select_prepared_bias(    //
-      x,                                               //
-      parameters.W,                                    //
-      *prepared_bias,                                  //
-      parameters.quant.item<float>(),                  //
-      retrieve_quantization_multiplier(parameters.W),  //
-      indices,                                         //
-      name                                             //
-  );
-  return y;
+  return SelectedAffine{
+      .W = std::move(selected_W),
+      .prepared_bias = std::move(selected_prepared_bias),
+      .a_quant = parameters.quant.item<float>(),
+      .b_quant = retrieve_quantization_multiplier(parameters.W),
+  };
+}
+
+Tensor affine_with_selected(const SelectedAffine &parameters, const Tensor &x,
+                            const std::string &name /*= ""*/) {
+  return qmm::affine_with_prepared_bias(x, parameters.W, parameters.prepared_bias,
+                                        parameters.a_quant, parameters.b_quant,
+                                        name);
 }
 
 Tensor linear(const Linear &parameters, const Tensor &x,

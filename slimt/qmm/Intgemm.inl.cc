@@ -35,6 +35,25 @@ Tensor prepare_bias<Provider::Intgemm>(const Tensor& W, const Tensor& b,
 }
 
 template <>
+Tensor select_columns<Provider::Intgemm>(const Tensor& W,
+                                         const std::vector<uint32_t>& indices,
+                                         const std::string& name) {
+  const Tensor& B = W;                // NOLINT
+  size_t B_cols = B.dim(-1);          // NOLINT
+  size_t B_rows = B.size() / B_cols;  // NOLINT
+  size_t width = B_rows;
+
+  Tensor selected_B(Type::i8, Shape({width, indices.size()}),  // NOLINT
+                    name.empty() ? "selected_B" : name);
+
+  const uint32_t* indices_begin = indices.data();
+  const uint32_t* indices_end = indices.data() + indices.size();
+  intgemm::Int8::SelectColumnsB(B.data<int8_t>(), selected_B.data<int8_t>(),
+                                B_rows, indices_begin, indices_end);
+  return selected_B;
+}
+
+template <>
 Tensor affine_with_select_prepared_bias<Provider::Intgemm>(
     const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
     float a_quant, float b_quant, const std::vector<uint32_t>& indices,

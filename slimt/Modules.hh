@@ -20,6 +20,18 @@ struct Affine {
   mutable float prepared_bias_b_quant = 0.0F;
 };
 
+// Snapshot of an Affine restricted to a fixed set of output columns
+// (a "shortlist"). Built once per decode in Model::decode and reused across
+// every decoder step, so the per-step output projection skips both the
+// column-selection and bias-gather work that the unselected
+// `affine_with_select_prepared_bias` would redo on every call.
+struct SelectedAffine {
+  Tensor W;
+  Tensor prepared_bias;
+  float a_quant = 0.0F;
+  float b_quant = 0.0F;
+};
+
 struct Linear {
   Tensor W;  // NOLINT
   Tensor quant;
@@ -124,9 +136,11 @@ class DecoderLayer {
   LayerNorm ffn_ffn_;
 };
 
-Tensor affine_with_select(const Affine &parameters, const Tensor &x,
-                          const std::vector<uint32_t> &indices,
-                          const std::string &name = "");
+SelectedAffine prepare_selected(const Affine &parameters,
+                                const std::vector<uint32_t> &indices);
+
+Tensor affine_with_selected(const SelectedAffine &parameters, const Tensor &x,
+                            const std::string &name = "");
 
 Tensor affine(const Affine &parameters, const Tensor &x,
               const std::string &name = "");
