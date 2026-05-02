@@ -27,8 +27,55 @@ const Tensor &retrieve_prepared_bias(const Affine &parameters) {
   return parameters.prepared_bias;
 }
 
+namespace {
+// Activation alpha for the int8 GEMM's quantize() step.
+//
+// Ruy's i8 quantize clips activations to ±127. The bergamot calibration
+// pipeline normally bakes a per-tensor alpha into the model file
+// (`*_QuantMultA`) so that `alpha * max|x| ≤ 127`. Two-vocab models
+// (en-ja, en-ko, en-zh, ...) ship no such alpha for the decoder output
+// projection — `decoder_Wemb_QuantMultA` is an empty placeholder and
+// `none_QuantMultA` is absent. Io.cc drops the placeholder name on load
+// so `Affine::quant` for those models comes back unloaded; we detect
+// that here and compute alpha dynamically from `max|x|`. Matches
+// marian-decoder's runtime behavior on the same files.
+float a_quant_for(const Affine &parameters, const Tensor &x) {
+  if (parameters.quant.loaded()) {
+    return parameters.quant.item<float>();
+  }
+  const float *data = x.data<float>();
+  size_t n = x.size();
+  float xmax = 0.0F;
+  for (size_t i = 0; i < n; ++i) {
+    float v = std::fabs(data[i]);
+    if (v > xmax) xmax = v;
+  }
+  if (xmax == 0.0F) return qmm::kInt8Maxf;  // arbitrary, tensor is all zeros
+  return qmm::kInt8Maxf / xmax;
+}
+
+// Same as a_quant_for but for the SelectedAffine path, where the static
+// value (if any) was captured into a float at decode start.
+float dynamic_a_quant(const Tensor &x) {
+  const float *data = x.data<float>();
+  size_t n = x.size();
+  float xmax = 0.0F;
+  for (size_t i = 0; i < n; ++i) {
+    float v = std::fabs(data[i]);
+    if (v > xmax) xmax = v;
+  }
+  if (xmax == 0.0F) return qmm::kInt8Maxf;
+  return qmm::kInt8Maxf / xmax;
+}
+}  // namespace
+
 void prepare_bias(Affine &parameters) {
-  float a_quant = parameters.quant.item<float>();
+  // For Ruy `qmm::prepare_bias` is a `b.clone()` that ignores both quant
+  // values, so it's safe to run even when `quant` is unloaded. The stored
+  // `prepared_bias_a_quant` is informational only and never consulted on
+  // the Ruy path; leave it 0 in that case.
+  float a_quant =
+      parameters.quant.loaded() ? parameters.quant.item<float>() : 0.0F;
   float b_quant = retrieve_quantization_multiplier(parameters.W);
   parameters.prepared_bias = qmm::prepare_bias(  //
       parameters.W, parameters.b,                //
@@ -168,9 +215,11 @@ Tensor affine(const Affine &parameters, const Tensor &x,
   if (parameters.prepared_bias_ready) {
     prepared_bias = &retrieve_prepared_bias(parameters);
   } else {
+    float a_quant_for_prep =
+        parameters.quant.loaded() ? parameters.quant.item<float>() : 0.0F;
     local_prepared_bias = qmm::prepare_bias(             //
         parameters.W, parameters.b,                      //
-        parameters.quant.item<float>(),                  //
+        a_quant_for_prep,                                //
         retrieve_quantization_multiplier(parameters.W),  //
         "prepared_bias"                                  //
     );
@@ -181,7 +230,7 @@ Tensor affine(const Affine &parameters, const Tensor &x,
       x,                                               //
       parameters.W,                                    //
       *prepared_bias,                                  //
-      parameters.quant.item<float>(),                  //
+      a_quant_for(parameters, x),                      //
       retrieve_quantization_multiplier(parameters.W),  //
       name                                             //
   );
@@ -205,18 +254,30 @@ SelectedAffine prepare_selected(const Affine &parameters,
     dst[i] = src[indices[i]];
   }
 
+  // Capture 0 as the "no calibrated alpha, use dynamic" sentinel; the file
+  // ships an empty `decoder_Wemb_QuantMultA` placeholder for two-vocab
+  // models, which Io.cc drops on load (see Tensor::loaded). We can't read
+  // a calibrated value here, but we don't have an `x` to compute dynamic
+  // either — defer that to `affine_with_selected`.
+  float a_quant =
+      parameters.quant.loaded() ? parameters.quant.item<float>() : 0.0F;
+
   return SelectedAffine{
       .W = std::move(selected_W),
       .prepared_bias = std::move(selected_prepared_bias),
-      .a_quant = parameters.quant.item<float>(),
+      .a_quant = a_quant,
       .b_quant = retrieve_quantization_multiplier(parameters.W),
   };
 }
 
 Tensor affine_with_selected(const SelectedAffine &parameters, const Tensor &x,
                             const std::string &name /*= ""*/) {
+  // a_quant == 0 is the "dynamic" sentinel set by `prepare_selected` when
+  // the underlying Affine had no calibrated alpha.
+  float a_quant =
+      parameters.a_quant > 0.0F ? parameters.a_quant : dynamic_a_quant(x);
   return qmm::affine_with_prepared_bias(x, parameters.W, parameters.prepared_bias,
-                                        parameters.a_quant, parameters.b_quant,
+                                        a_quant, parameters.b_quant,
                                         name);
 }
 

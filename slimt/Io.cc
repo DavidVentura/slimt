@@ -161,15 +161,6 @@ std::vector<io::Item> load_items(void* current) {
   // never used as a GEMM B-matrix.
   Item embedding_processed;
   Item decoder_embedding_processed;
-  // Synthetic `none_QuantMultA` for two-vocab models. Shared-vocab models
-  // already ship one as a separate float32 item that the decoder output
-  // projection's `Affine::quant` reads. Two-vocab models only ship
-  // `decoder_Wemb_QuantMultA` (a placeholder marker, no useful data); the
-  // actual quantization multiplier is appended to the end of the
-  // `decoder_Wemb` data buffer. We synthesize an extra
-  // `none_QuantMultA` item carrying that float so the parameter map's
-  // existing `none_QuantMultA → output_.quant` slot still resolves.
-  Item synthesized_none_quant_mult_a;
 
   // Recognises the three embedding tensor names slimt knows about. Anything
   // else with name ending in "_QuantMultA" stays a quantization-multiplier
@@ -200,12 +191,18 @@ std::vector<io::Item> load_items(void* current) {
       // the embedding that doubles as the decoder output projection) also
       // produce a PrepareB-prepared int8 alias for the GEMM.
       if (is_quant_mult_a_marker(item.name)) {
-        // Pointing to this, that's all, mostly a no-op and prevents falling
-        // into the other branch.
-        item.view = View{
-            .data = ptr,                       //
-            .size = static_cast<size_t>(size)  //
-        };
+        // Two-vocab bergamot models (en-ja, en-ko, en-zh, ...) ship a
+        // `decoder_Wemb_QuantMultA` placeholder of type ig8 with no real
+        // float payload — the calibration tooling never extracted a value
+        // for it (likely a marian-dev/scripts/alphas/extract_stats.py gap
+        // around the two-vocab `decoder_Wemb` naming). Shared-vocab models
+        // similarly ship a `Wemb_QuantMultA` ig8 placeholder alongside the
+        // real `none_QuantMultA` f32 scalar. In both cases the marker
+        // carries no usable data, so we drop the name to skip the load
+        // entirely; `Modules::affine` then sees an unloaded `output_.quant`
+        // and falls back to dynamic activation quantization (matching
+        // marian-decoder's runtime behavior on missing alphas).
+        item.name = "";
       } else if (is_embedding_name(item.name)) {  // NOLINT
         size_t num_elements = item.shape.elements();
         // At the end of items is the quantization multiplier.So we do some
@@ -256,20 +253,6 @@ std::vector<io::Item> load_items(void* current) {
           *embedding_quantization_multiplier_addr = quantization_multiplier;
 
           set_item(processed, std::move(embedding_aligned));
-
-          // For two-vocab models the file has no separate `none_QuantMultA`
-          // item, but the decoder output projection's quant tensor still
-          // needs to be filled. Synthesize one carrying the multiplier we
-          // just extracted.
-          if (item.name == "decoder_Wemb") {
-            synthesized_none_quant_mult_a.name = "none_QuantMultA";
-            synthesized_none_quant_mult_a.shape = Shape({1});
-            synthesized_none_quant_mult_a.type = Type::f32;
-            Aligned quant_aligned(kAlignWidth, sizeof(float));
-            *reinterpret_cast<float*>(quant_aligned.data()) =
-                quantization_multiplier;
-            set_item(synthesized_none_quant_mult_a, std::move(quant_aligned));
-          }
         }
       } else {
         // The matrix has to be processed to the format expected by the QMM backend.
@@ -322,7 +305,6 @@ std::vector<io::Item> load_items(void* current) {
   // Transformer's parameter map never looks up — harmless.
   items.push_back(std::move(embedding_processed));
   items.push_back(std::move(decoder_embedding_processed));
-  items.push_back(std::move(synthesized_none_quant_mult_a));
   return items;
 }
 

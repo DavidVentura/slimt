@@ -322,10 +322,16 @@ void Transformer::load_parameters() {
     // Embedding-related slots are intentionally over-registered (Wemb,
     // encoder_Wemb, decoder_Wemb) — at most one set of names matches any
     // given model file. Suppress the warning for the unmatched ones.
+    //
+    // `none_QuantMultA` is the activation alpha for the decoder output
+    // projection on shared-vocab models. Two-vocab models (en-ja, en-ko,
+    // ...) ship neither it nor `decoder_Wemb_QuantMultA` with a real
+    // value; Modules::affine falls back to dynamic activation
+    // quantization in that case (see `a_quant_for`).
     const std::string &name = parameter.first;
     if (name == "Wemb" || name == "encoder_Wemb" || name == "decoder_Wemb" ||
         name == "Wemb_intgemm8" || name == "decoder_Wemb_intgemm8" ||
-        name == "decoder_Wemb_QuantMultA") {
+        name == "decoder_Wemb_QuantMultA" || name == "none_QuantMultA") {
       continue;
     }
     std::cerr << "[warn] Failed to complete expected load of ";
