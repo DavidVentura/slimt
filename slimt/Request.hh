@@ -46,6 +46,7 @@ class Request {
   /// the Response upon completion of the Request.
   Request(size_t id, size_t model_id, AnnotatedText &&source,
           Segments &&segments, const Vocabulary &vocabulary,
+          std::shared_ptr<const Words> shortlist_words,
           std::optional<TranslationCache> &cache, Continuation &&continuation,
           OnError &&on_error, bool with_alignment);
 
@@ -60,6 +61,9 @@ class Request {
   /// Obtains segment corresponding to index  to create a batch of segments
   /// among several requests.
   const Segment &segment(size_t index) const;
+  const std::shared_ptr<const Words> &shortlist_words() const {
+    return shortlist_words_;
+  }
 
   /// For notions of priority among requests, used to enable std::set in
   /// BatchingPool.
@@ -103,6 +107,7 @@ class Request {
   /// segments_ hold the segments processed into Words which generated from
   /// input string.
   Segments segments_;
+  std::shared_ptr<const Words> shortlist_words_;
 
   const Vocabulary &vocabulary_;
 

@@ -1,9 +1,12 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <utility>
 #include <vector>
 
 #include "slimt/Tensor.hh"
+#include "slimt/Types.hh"
 
 namespace slimt {
 
@@ -18,6 +21,12 @@ class Input {
   const Tensor &indices() const { return batch_; }
   const Tensor &mask() const { return mask_; }
   const std::vector<uint32_t> &words() const { return words_; }
+  void set_shortlist_words(std::shared_ptr<const Words> words) {
+    shortlist_words_ = std::move(words);
+  }
+  const std::shared_ptr<const Words> &shortlist_words() const {
+    return shortlist_words_;
+  }
   const std::vector<size_t> &lengths() const { return lengths_; }
   size_t index() const { return index_; }
   float occupancy();
@@ -25,6 +34,7 @@ class Input {
 
  private:
   std::vector<uint32_t> words_;
+  std::shared_ptr<const Words> shortlist_words_;
   std::vector<size_t> lengths_;
   Tensor batch_;
   Tensor mask_;

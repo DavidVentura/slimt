@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,7 @@ class ShortlistGenerator {
   static constexpr uint64_t kFrequent = 100;
   static constexpr uint64_t kBest = 100;
   static constexpr size_t kVExtAlignment = 8;
+  static constexpr size_t kMinCandidates = 500;
 
   // construct directly from buffer
   ShortlistGenerator(
@@ -52,6 +54,8 @@ class ShortlistGenerator {
       bool check = false);
 
   Shortlist generate(const Words& words) const;
+  std::optional<Shortlist> generate(const Words& words,
+                                    size_t min_candidates) const;
 
  private:
   const Vocabulary& source_;

@@ -182,9 +182,8 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   size_t source_sequence_length = encoder_out.dim(-2);
 
   std::optional<Words> indices = std::nullopt;
-  if (shortlist_generator_) {
-    Shortlist shortlist = shortlist_generator_->generate(input.words());
-    indices = shortlist.words();
+  if (input.shortlist_words()) {
+    indices = *input.shortlist_words();
   }
   // The following can be used to check if shortlist is going wrong.
   // std::vector<uint32_t> indices(target_vocab.size());

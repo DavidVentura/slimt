@@ -34,6 +34,7 @@ Input convert(const Batch &batch, uint32_t pad_id, float limit_factor) {
     input.add(segment);
   }
 
+  input.set_shortlist_words(batch.shortlist_words());
   input.finalize();
   return input;
 }
@@ -74,6 +75,20 @@ Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
                           AnnotatedText &&annotated_text, Segments &&segments,
                           Continuation &&continuation, OnError &&on_error,
                           bool with_alignment) {
+  std::shared_ptr<const Words> shortlist_words;
+  if (model->shortlist_generator()) {
+    Words context_words;
+    for (const Segment &segment : segments) {
+      context_words.insert(context_words.end(), segment.begin(), segment.end());
+    }
+
+    auto shortlist = model->shortlist_generator()->generate(
+        context_words, ShortlistGenerator::kMinCandidates);
+    if (shortlist) {
+      shortlist_words = std::make_shared<const Words>(shortlist->words());
+    }
+  }
+
   auto request = std::make_shared<Request>(      //
       id, model->id(),                           //
       std::move(annotated_text),                 //
@@ -82,6 +97,7 @@ Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
       // which is distinct from the source vocab on two-vocab models like
       // bergamot's en-zh / en-ja / en-ko / en-zh_hant / zh_hant-en.
       model->target_vocabulary(),                //
+      std::move(shortlist_words),                //
       cache,                                     //
       std::forward<Continuation>(continuation),  //
       std::forward<OnError>(on_error),           //

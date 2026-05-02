@@ -33,6 +33,7 @@ size_t cache_key(size_t model_id, const Words &words, bool with_alignment) {
 // -----------------------------------------------------------------
 Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
                  Segments &&segments, const Vocabulary &vocabulary,
+                 std::shared_ptr<const Words> shortlist_words,
                  std::optional<TranslationCache> &cache,
                  Continuation &&continuation, OnError &&on_error,
                  bool with_alignment)
@@ -40,6 +41,7 @@ Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
       model_id_(model_id),
       source_(std::move(source)),
       segments_(std::move(segments)),
+      shortlist_words_(std::move(shortlist_words)),
       vocabulary_(vocabulary),
       cache_(cache),
       continuation_(std::move(continuation)),

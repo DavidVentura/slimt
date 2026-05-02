@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <set>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 #include "slimt/Macros.hh"
@@ -77,6 +79,45 @@ void Batch::clear() {
   segment_refs_.clear();
   token_count_ = 0;
   max_length_ = 0;
+}
+
+std::shared_ptr<const Words> Batch::shortlist_words() const {
+  std::shared_ptr<const Words> single;
+  std::set<Word> merged;
+  size_t request_count = 0;
+  std::unordered_set<const Request *> seen;
+
+  for (const auto &segment_ref : segment_refs_) {
+    const auto &request = segment_ref.request();
+    if (!seen.insert(request.get()).second) {
+      continue;
+    }
+
+    const auto &request_shortlist = request->shortlist_words();
+    if (!request_shortlist) {
+      return nullptr;
+    }
+
+    request_count++;
+    if (request_count == 1) {
+      single = request_shortlist;
+      continue;
+    }
+
+    if (request_count == 2 && single) {
+      merged.insert(single->begin(), single->end());
+      single.reset();
+    }
+    merged.insert(request_shortlist->begin(), request_shortlist->end());
+  }
+
+  if (request_count == 0) {
+    return nullptr;
+  }
+  if (request_count == 1) {
+    return single;
+  }
+  return std::make_shared<const Words>(merged.begin(), merged.end());
 }
 
 size_t AggregateBatcher::Hash::operator()(

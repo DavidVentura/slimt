@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -197,6 +198,15 @@ Shortlist ShortlistGenerator::generate(const Words& words) const {
   }
 
   return Shortlist(std::move(indices));
+}
+
+std::optional<Shortlist> ShortlistGenerator::generate(
+    const Words& words, size_t min_candidates) const {
+  Shortlist shortlist = generate(words);
+  if (shortlist.words().size() < min_candidates) {
+    return std::nullopt;
+  }
+  return shortlist;
 }
 
 }  // namespace slimt

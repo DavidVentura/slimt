@@ -34,6 +34,8 @@ class SegmentRef {
   /// Accessor to the segment represented by the SegmentRef.
   const Segment &get() const;
 
+  const Ptr<Request> &request() const { return request_; }
+
   /// Forwards history to Request to set history corresponding to this
   /// SegmentRef.
   void complete(History history);
@@ -70,6 +72,8 @@ class Batch {
   // segment_refs() are used to access segment_refs to construct marian internal
   // batch.
   const SegmentRefs &segment_refs() const { return segment_refs_; }
+
+  std::shared_ptr<const Words> shortlist_words() const;
 
   // On obtaining Histories after translating a batch, complete can be
   // called with Histories , which forwards the call to Request through
