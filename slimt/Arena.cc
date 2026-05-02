@@ -31,7 +31,7 @@ void* Arena::allocate(size_t bytes, size_t alignment) {
   }
   // Chunks are allocated at kAlignWidth which covers the alignments slimt asks
   // for; fresh chunks start at offset 0 (aligned). Round size up to alignment
-  // so intgemm's wide stores past the logical size don't clobber the next
+  // so vectorized stores past the logical size don't clobber the next
   // allocation (this matches what aligned_alloc does on the heap path).
   assert(alignment <= kAlignWidth);
   size_t padded_bytes = ((bytes + alignment - 1) / alignment) * alignment;

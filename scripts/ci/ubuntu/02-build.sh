@@ -3,11 +3,7 @@
 set -eo pipefail
 
 ARGS=(
-  -DWITH_INTGEMM=OFF
-  -DWITH_RUY=OFF
-  -DWITH_GEMMOLOGY=ON
-  -DUSE_AVX512=ON -DUSE_AVX2=ON -DUSE_SSSE3=ON -DUSE_SSE2=ON
-  -DWITH_BLAS=ON
+  -DUSE_AVX2=ON
 
   # TODO(jerinphilip) Adjust, later.
   -DCMAKE_BUILD_TYPE=Debug

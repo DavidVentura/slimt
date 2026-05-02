@@ -15,10 +15,7 @@ function slimt-check-clang-tidy {
     -DCMAKE_EXPORT_COMPILE_COMMANDS=on
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
     -DUSE_BUILTIN_SENTENCEPIECE=ON
-    -DWITH_INTGEMM=ON -DUSE_AVX2=ON -DUSE_SSE2=ON
-
-    # Gemmology, which is default on has to be turned off.
-    -DWITH_GEMMOLOGY=OFF
+    -DUSE_AVX2=ON
   )
 
   cmake -B build -S . "${ARGS[@]}"

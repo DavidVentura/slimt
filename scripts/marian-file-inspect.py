@@ -20,10 +20,10 @@ TYPE_CLASS = Bijective({
     "signed_type"   : int("0x0100", 16),
     "unsigned_type" : int("0x0200", 16),
     "float_type"    : int("0x0400", 16),
-    "packed_type"   : int("0x0800", 16),  # special packed (CPU cache friendly) type class, used in FBGEMM. Annoyingly we need to keep 0x800 for back-compat, would be nicer to align with intgemm
+    "packed_type"   : int("0x0800", 16),  # special packed (CPU cache friendly) type class, used in FBGEMM.
     "avx2_type"     : int("0x1000", 16),  # processor-specific layout for avx2, currently used for FBGEMM only (keep 0x1000 for back-compat)
     "avx512_type"   : int("0x2000", 16),  # processor-specific layout for avx512, currently used for FBGEMM only (keep 0x2000 for back-compat)
-    "intgemm_type"  : int("0x4000", 16),  # intgemm quantized architecture agnostic models
+    "intgemm_type"  : int("0x4000", 16),  # legacy intgemm-format quantized models
     "size_mask"     : int("0x00FF", 16),  # maximum allowed size is 256 bytes right now; if more are required, extend the size field
     "class_mask"    : int("0xFF00", 16),  # three fields for different type classes, if more classes are added we need to increase the number of fields here
 })
@@ -47,8 +47,8 @@ TYPE = Bijective({
     "packed8avx2"   : TYPE_CLASS.get("packed_type")   + 2 + TYPE_CLASS.get("avx2_type"),    # special type for FBGEMM with AVX2, not meant to be used anywhere else, not meant to be accessed invidually. Internal actual type (uint8) is meaningless.
     "packed8avx512" : TYPE_CLASS.get("packed_type")   + 1 + TYPE_CLASS.get("avx512_type"),  # special type for FBGEMM with AVX512, not meant to be used anywhere else, not meant to be accessed invidually. Internal actual type (uint8) is meaningless.
 
-    "intgemm8"      : TYPE_CLASS.get("signed_type")   + 1 + TYPE_CLASS.get("intgemm_type"), # Int8 quantized (not packed) matrices for intgemm
-    "intgemm16"     : TYPE_CLASS.get("signed_type")   + 2 + TYPE_CLASS.get("intgemm_type"), # Int16 quantized (not packed) matrices for intgemm
+    "intgemm8"      : TYPE_CLASS.get("signed_type")   + 1 + TYPE_CLASS.get("intgemm_type"), # legacy int8 quantized matrices
+    "intgemm16"     : TYPE_CLASS.get("signed_type")   + 2 + TYPE_CLASS.get("intgemm_type"), # legacy int16 quantized matrices
 })
 # fmt: on
 

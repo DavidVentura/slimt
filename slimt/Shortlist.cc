@@ -179,8 +179,7 @@ Shortlist ShortlistGenerator::generate(const Words& words) const {
   }
 
   // Ensure that the generated vocabulary items from a shortlist are a
-  // multiple-of-eight This is necessary until intgemm supports
-  // non-multiple-of-eight matrices.
+  // multiple of the vector extension alignment.
   for (size_t i = frequent_;
        i < target_size && target_table_ones % kVExtAlignment != 0; i++) {
     if (!target_table[i]) {

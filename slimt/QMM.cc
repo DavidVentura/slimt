@@ -1,37 +1,10 @@
 #include "slimt/QMM.hh"
 
-#ifdef SLIMT_HAS_INTGEMM
-#include <cstddef>
-#include <cstdint>
-#include <string>
-#include <vector>
-
-#include "slimt/Tensor.hh"
-
-namespace slimt::qmm::detail {
-constexpr Provider kProvider = Provider::Intgemm;
-}
-// NOLINTNEXTLINE: The C++ file inclusion is intended.
-#include "slimt/qmm/Intgemm.inl.cc"
-#endif
-
-#ifdef SLIMT_HAS_RUY
-
 namespace slimt::qmm::detail {
 constexpr Provider kProvider = Provider::Ruy;
 }
 // NOLINTNEXTLINE: The C++ file inclusion is intended.
 #include "slimt/qmm/Ruy.inl.cc"
-#endif
-
-#ifdef SLIMT_HAS_GEMMOLOGY
-
-namespace slimt::qmm::detail {
-constexpr Provider kProvider = Provider::Gemmology;
-}
-// NOLINTNEXTLINE: The C++ file inclusion is intended.
-#include "slimt/qmm/Gemmology.inl.cc"
-#endif
 
 namespace slimt::qmm {
 Tensor affine(const Tensor& x, const Tensor& W, const Tensor& b, float a_quant,

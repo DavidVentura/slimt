@@ -10,8 +10,8 @@ url="https://github.com/jerinphilip/slimt"
 fragment=main
 license=('Apache')
 groups=()
-depends=('sentencepiece-git' 'openblas')
-makedepends=('git' 'cmake' 'gcc' 'sentencepiece-git' 'xsimd')
+depends=('sentencepiece-git')
+makedepends=('git' 'cmake' 'gcc' 'sentencepiece-git')
 checkdepends=()
 optdepends=('gperftools')
 provides=()
@@ -37,7 +37,6 @@ build() {
 
   CONFIGURE_ARGS=(
     -DUSE_BUILTIN_SENTENCEPIECE=OFF
-    -DWITH_GEMMOLOGY=ON -DUSE_AVX512=ON -DUSE_AVX2=ON -DUSE_SSE2=ON -DUSE_SSSE3=ON
     -DSLIMT_PACKAGE=ON
     -DCMAKE_INSTALL_PREFIX=/usr/
     -DBUILD_STATIC=OFF

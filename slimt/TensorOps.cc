@@ -6,22 +6,7 @@
 
 #include "slimt/Simd.hh"
 #include "slimt/Tensor.hh"
-
-#ifdef SLIMT_HAS_BLAS
-
-#ifdef __cplusplus
-extern "C" {
-#endif  // __cplusplus
-
-#include <cblas.h>
-
-#ifdef __cplusplus
-}
-#endif  // __cplusplus
-
-#else  // SLIMT_HAS_BLAS
 #include "ruy/ruy.h"
-#endif  // SLIMT_HAS_BLAS
 
 #include <algorithm>
 #include <cassert>
@@ -409,7 +394,6 @@ void softmax(float* logits, size_t batch_size, size_t num_classes, float* out) {
 
 // NOLINTBEGIN
 enum class Provider {
-  BLAS,
   Ruy,
 };
 // NOLINTEND
@@ -425,68 +409,6 @@ void matrix_multiply(              //
     float* C, size_t ldc           //
 );
 
-#ifdef SLIMT_HAS_BLAS
-template <>
-void matrix_multiply<Provider::BLAS>(  //
-    bool trans_a, bool trans_b,        //
-    size_t m, size_t n, size_t k,      //
-    float alpha,                       //
-    const float* A, size_t lda,        //
-    const float* B, size_t ldb,        //
-    float beta,                        //
-    float* C, size_t ldc) {
-  // clang-format off
-  //
-  //  4. m
-  //     Specifies the number of rows of the matrix op(A) and of the matrix C.
-  //     The value of m at least zero.
-  //  5. n
-  //     Specifies the number of columns of the matrix op(B) and the number of
-  //     columns of the matrix C. The value of n at least zero.
-  //  6. k
-  //     Specifies the number of columns of the matrix op(A) and the number of
-  //     rows of the matrix op(B). The value of k at least zero.
-  //
-  //  9. lda
-  //                    |  transa=CblasNoTrans   |  transa=CblasTrans 
-  //      CblasColMajor | lda at least max(1, m).|   lda at least max(1, k)
-  //      CblasRowMajor | lda at least max(1, k) |   lda at least max(1, m).
-  //
-  // 11. ldb
-  //                    | transb=CblasNoTrans     | transb=CblasTrans
-  //     CblasColMajorA | ldb at least max(1, k). | ldb at least max(1, n).
-  //     CblasRowMajor  | ldb at least max(1, n). | ldb at least max(1, k).
-  //
-  // 14. ldc
-  //
-  //      CblasColMajor | ldc must be at least max(1, m).
-  //      CblasRowMajor | ldc must be at least max(1, n).
-  //
-  // clang-format on
-
-  CBLAS_TRANSPOSE c_trans_a = trans_a ? CblasTrans : CblasNoTrans;
-  CBLAS_TRANSPOSE c_trans_b = trans_b ? CblasTrans : CblasNoTrans;
-
-  // Consider matrices A [rows_a x cols_a], B[rows_b x cols_b]
-  // A and B are not necessarily compatible for multiplication.
-  //
-  // op(A) * op(B) must be compatible for matrix multiplication, where op is
-  // transpose or no-transpose (identity) indicated by bools trans_a and
-  // trans_b.
-
-  cblas_sgemm(                              //
-      CblasRowMajor, c_trans_a, c_trans_b,  // Layout, op(A), op(B)
-      m, n, k,                              //
-      alpha,                                //
-      A, lda, B, ldb,                       //
-      beta,                                 //
-      C, ldc                                //
-  );
-}
-
-constexpr Provider kChosenProvider = Provider::BLAS;
-
-#else
 template <>
 inline void matrix_multiply<Provider::Ruy>(  //
     bool transA, bool transB,                //
@@ -576,8 +498,6 @@ inline void matrix_multiply<Provider::Ruy>(  //
 }
 
 constexpr Provider kChosenProvider = Provider::Ruy;
-
-#endif
 
 void batch_matrix_multiply(const float* A, const float* B, size_t batch_size,
                            size_t rows_a, size_t cols_a, size_t rows_b,

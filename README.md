@@ -49,16 +49,10 @@ More information on the models are described in the following papers:
 The large-list of dependencies from bergamot-translator have currently been
 reduced to:
 
-* For `int8_t` matrix-multiply [intgemm](https://github.com/kpu/intgemm)
-  (`x86_64`) or [ruy](https://github.com/google/ruy) (`aarch64`) or
-  [xsimd](https://github.com/xtensor-stack/xsimd) via
-  [gemmology](https://github.com/mozilla/gemmology).
+* For matrix multiplication - [ruy](https://github.com/google/ruy).
 * For vocabulary - [sentencepiece](https://github.com/browsermt/sentencepiece). 
 * For sentence-splitting using regular-expressions
   [PCRE2](https://github.com/PCRE2Project/pcre2).
-* For `sgemm` - Whatever BLAS provider is found via CMake (openblas,
-  intel-oneapimkl, cblas).  Feel free to provide
-  [hints](https://cmake.org/cmake/help/latest/module/FindBLAS.html#blas-lapack-vendors). 
 * [CLI11](https://github.com/CLIUtils/CLI11/) (only a dependency for cmdline) 
 
 Source code is made public where basic functionality (text-translation) works
@@ -80,19 +74,7 @@ dependencies. The following, being prepared towards linux distribution should
 work at the moment:
 
 ```bash
-# Configure to use xsimd via gemmology
 ARGS=(
-    # Use gemmology
-    -DWITH_GEMMOLOGY=ON               
-
-    # On x86_64 machines use the following to enable a faster matrix
-    # multiplication backend using SIMD. All of these can co-exist and dispatch
-    # on best detecting CPU at runtime.
-    -DUSE_AVX512=ON -DUSE_AVX2=ON -DUSE_SSSE3=ON -DUSE_SSE2=ON
-
-    # Uncomment below line, comment x86_64 above and use for aarch64, armv7+neon)
-    # -DUSE_NEON=ON 
-
     # Use sentencepiece installed via system.
     -DUSE_BUILTIN_SENTENCEPIECE=OFF        
 
@@ -110,16 +92,15 @@ cmake --build build --target all
 sudo cmake --build build --target install 
 ```
 
-The above run expects the packages `sentencepiece`, `xsimd` and a BLAS provider
+The above run expects the package `sentencepiece`
 to come from the system's package manager. Examples of this in distributions
 include:
 
 ```bash
 # Debian based systems
-sudo apt-get install -y libxsimd-dev libsentencepiece-dev libopenblas-dev
+sudo apt-get install -y libsentencepiece-dev
 
 # ArchLinux
-pacman -S openblas xsimd
 yay -S sentencepiece-git
 ```
 

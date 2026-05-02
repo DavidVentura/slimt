@@ -223,7 +223,7 @@ void prepare_weight_quantized_transposed<Provider::Ruy>(const int8_t* input,
               /*count=*/sizeof(int8_t) * (rows * cols));
 }
 
-// The "prepared bias" optimization is intgemm-specific: it folds the
+// The legacy "prepared bias" optimization folded the
 // shift-quantization compensation (column sums of W * a_quant_shift) into
 // the bias once so subsequent affine calls can skip the per-call
 // compensation pass. Ruy uses signed-signed int8 multiplication and applies

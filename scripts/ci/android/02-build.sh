@@ -12,12 +12,8 @@ function cmake-configure {
   pushd build
 
   SLIMT_ARGS=(
-    -DWITH_RUY=ON
-    -DWITH_INTGEMM=OFF
-    -DWITH_GEMMOLOGY=OFF
     -DUSE_BUILTIN_SENTENCEPIECE=ON
     -DUSE_NEON=ON
-    -DWITH_BLAS=OFF
     -DSLIMT_USE_INTERNAL_PCRE2=ON
     -DBUILD_JNI=ON
   )

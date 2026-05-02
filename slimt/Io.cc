@@ -43,7 +43,7 @@ enum class TypeClass : size_t {
   avx2_type     = 0x1000, // processor-specific layout for avx2, currently used for FBGEMM only
   avx512_type   = 0x2000, // processor-specific layout for avx512, currently used for FBGEMM only
 
-  intgemm_type = 0x4000, // intgemm quantized architecture agnostic models
+  intgemm_type = 0x4000, // legacy intgemm-format quantized models
 
 
   size_mask     = 0x00FF,
@@ -79,8 +79,8 @@ enum class OGType : size_t {
   packed8avx2   = TypeClass::packed_type + 1u + TypeClass::avx2_type,   // special type for FBGEMM with AVX2, not meant to be used anywhere else, not meant to be accessed invidually. Internal actual type (uint8) is meaningless.
   packed8avx512 = TypeClass::packed_type + 1u + TypeClass::avx512_type, // special type for FBGEMM with AVX512, not meant to be used anywhere else, not meant to be accessed invidually. Internal actual type (uint8) is meaningless.
 
-  intgemm8      = TypeClass::signed_type + 1u + TypeClass::intgemm_type, // Int8 quantized (not packed) matrices for intgemm
-  intgemm16     = TypeClass::signed_type + 2u + TypeClass::intgemm_type // Int16 quantized (not packed) matrices for intgemm
+  intgemm8      = TypeClass::signed_type + 1u + TypeClass::intgemm_type, // legacy int8 quantized matrices
+  intgemm16     = TypeClass::signed_type + 2u + TypeClass::intgemm_type // legacy int16 quantized matrices
 };
 
 // clang-format on
@@ -272,7 +272,7 @@ std::vector<io::Item> load_items(void* current) {
           }
         }
       } else {
-        // The matrix has to be processed to the format expected by intgemm.
+        // The matrix has to be processed to the format expected by the QMM backend.
         size_t rows = item.shape.dim(-2);
         size_t cols = item.shape.dim(-1);
         auto* input = reinterpret_cast<int8_t*>(ptr);

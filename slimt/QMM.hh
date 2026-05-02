@@ -15,10 +15,7 @@ constexpr float kInt8Maxf = 127.0F;
 namespace detail {
 
 enum class Provider {
-  None,      //
-  Intgemm,   //
-  Ruy,       //
-  Gemmology  //
+  Ruy,  //
 };
 
 template <enum Provider>
