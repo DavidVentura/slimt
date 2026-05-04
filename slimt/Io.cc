@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -23,11 +24,27 @@ namespace slimt::io {
 
 namespace {
 
-template <typename Element, typename ReadHead = void*>
-Element* emit(ReadHead& read_head, uint64_t size = 1) {
-  auto* begin = reinterpret_cast<Element*>(read_head);
-  Element* end = begin + size;
-  read_head = reinterpret_cast<void*>(end);
+template <typename Element>
+Element read(void*& read_head) {
+  Element value;
+  std::memcpy(&value, read_head, sizeof(Element));
+  read_head = static_cast<char*>(read_head) + sizeof(Element);
+  return value;
+}
+
+template <typename Element>
+std::vector<Element> read_vector(void*& read_head, uint64_t size) {
+  std::vector<Element> values(size);
+  if (size > 0) {
+    std::memcpy(values.data(), read_head, size * sizeof(Element));
+  }
+  read_head = static_cast<char*>(read_head) + size * sizeof(Element);
+  return values;
+}
+
+char* read_bytes(void*& read_head, uint64_t size) {
+  auto* begin = static_cast<char*>(read_head);
+  read_head = begin + size;
   return begin;
 }
 
@@ -113,7 +130,7 @@ void set_item(Item& item, Aligned&& aligned) {
 }
 
 std::vector<io::Item> load_items(void* current) {
-  uint64_t binary_file_version = *emit<uint64_t>(current);
+  uint64_t binary_file_version = read<uint64_t>(current);
   if (binary_file_version != kBinaryFileVersion) {
     throw std::runtime_error(
         "[slimt] model file binary version mismatch: file is v" +
@@ -123,8 +140,8 @@ std::vector<io::Item> load_items(void* current) {
   }
 
   // Read number of headers and based on the information, the headers.
-  uint64_t num_headers = *emit<uint64_t>(current);
-  Header* headers = emit<Header>(current, num_headers);  // NOLINT
+  uint64_t num_headers = read<uint64_t>(current);
+  std::vector<Header> headers = read_vector<Header>(current, num_headers);
 
   // prepopulate items with meta data from headers
   std::vector<io::Item> items;
@@ -134,7 +151,7 @@ std::vector<io::Item> load_items(void* current) {
 
     // Can someone explain the -1? Remains a mystery to me.
     size_t length = headers[i].name_length;
-    char* name = emit<char>(current, length);
+    char* name = read_bytes(current, length);
     items[i].name = std::string(name, length - 1);
   }
 
@@ -143,15 +160,15 @@ std::vector<io::Item> load_items(void* current) {
     Item& item = items[i];
 
     uint64_t size = headers[i].shape_length;
-    int* shape = emit<int>(current, size);
+    std::vector<int> shape = read_vector<int>(current, size);
 
     // This copy has to be incurred, because metadata.
-    item.shape.set(shape, shape + size);
+    item.shape.set(shape.data(), shape.data() + shape.size());
   }
 
   // move by offset bytes, aligned to 256-bytes boundary
-  uint64_t offset = *emit<uint64_t>(current);
-  emit<char>(current, offset);
+  uint64_t offset = read<uint64_t>(current);
+  read_bytes(current, offset);
 
   // Keep extra items for the int8-prepared (PrepareB-form) versions of any
   // embeddings that double as the decoder output projection. For shared-vocab
@@ -178,7 +195,7 @@ std::vector<io::Item> load_items(void* current) {
   for (uint64_t i = 0; i < num_headers; ++i) {
     Item& item = items[i];
     uint64_t size = headers[i].data_length;
-    char* ptr = emit<char>(current, size);
+    char* ptr = read_bytes(current, size);
     // We're about to read-data.
     // We can either make it point to mmap, which is aligned,
     // or we can create a new aligned.
