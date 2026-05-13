@@ -208,18 +208,33 @@ std::vector<io::Item> load_items(void* current) {
       // the embedding that doubles as the decoder output projection) also
       // produce a PrepareB-prepared int8 alias for the GEMM.
       if (is_quant_mult_a_marker(item.name)) {
-        // Two-vocab bergamot models (en-ja, en-ko, en-zh, ...) ship a
-        // `decoder_Wemb_QuantMultA` placeholder of type ig8 with no real
-        // float payload — the calibration tooling never extracted a value
-        // for it (likely a marian-dev/scripts/alphas/extract_stats.py gap
-        // around the two-vocab `decoder_Wemb` naming). Shared-vocab models
-        // similarly ship a `Wemb_QuantMultA` ig8 placeholder alongside the
-        // real `none_QuantMultA` f32 scalar. In both cases the marker
-        // carries no usable data, so we drop the name to skip the load
-        // entirely; `Modules::affine` then sees an unloaded `output_.quant`
-        // and falls back to dynamic activation quantization (matching
-        // marian-decoder's runtime behavior on missing alphas).
-        item.name = "";
+        // `*_Wemb_QuantMultA` tensors aren't empty placeholders despite
+        // their shape-[1,1] size — marian stores them in the ig8 layout
+        // (`shape.elements()` int8 values followed by the f32 `quantMult`)
+        // and `marian-dev/.../integer_common.h::unquantizeWemb` reads them
+        // back as `alpha[i] = int8[i] / quantMult`. For these alpha
+        // tensors that's one int8 (=127, the saturated post-quantize value)
+        // plus the multiplier, which un-quantizes to the original
+        // calibrated activation alpha (≈4–8 for tiny11 bergamot models).
+        //
+        // We only need to materialize the value for `decoder_Wemb_QuantMultA`
+        // — on shared-vocab models the same alpha is also shipped as a
+        // real f32 `none_QuantMultA` that the parameter map already
+        // consumes, and `encoder_Wemb` is an embedding-lookup-only tensor
+        // with no output-projection GEMM. Drop those by clearing the name;
+        // for `decoder_Wemb_QuantMultA` (the only source on two-vocab
+        // models like en-ja / zh_hant-en) un-quantize and store as f32.
+        size_t num_elements = item.shape.elements();
+        char* mult_addr = ptr + num_elements;
+        float quant_mult;
+        std::memcpy(&quant_mult, mult_addr, sizeof(float));
+
+        Aligned aligned(kAlignWidth, sizeof(float));
+        auto* out = reinterpret_cast<float*>(aligned.data());
+        out[0] =
+            static_cast<float>(reinterpret_cast<int8_t*>(ptr)[0]) / quant_mult;
+        set_item(item, std::move(aligned));
+        item.type = Type::f32;
       } else if (is_embedding_name(item.name)) {  // NOLINT
         size_t num_elements = item.shape.elements();
         // At the end of items is the quantization multiplier.So we do some

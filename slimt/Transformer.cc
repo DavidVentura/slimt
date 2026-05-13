@@ -316,6 +316,16 @@ void Transformer::load_parameters() {
   }
 
   for (std::string &entry : missed) {
+    // `Wemb_QuantMultA` and `encoder_Wemb_QuantMultA` ship in the model
+    // file as ig8 alpha markers. Io.cc un-quantizes them into real f32
+    // values, but they have no parameter slot — the decoder output
+    // projection's alpha comes from `none_QuantMultA` (shared-vocab) or
+    // `decoder_Wemb_QuantMultA` (two-vocab), and the encoder doesn't
+    // GEMM through `encoder_Wemb` at all. So these are harmlessly
+    // unconsumed; don't warn.
+    if (entry == "Wemb_QuantMultA" || entry == "encoder_Wemb_QuantMultA") {
+      continue;
+    }
     std::cerr << "[warn] Failed to ingest expected load of " << entry << "\n";
   }
   for (auto &parameter : parameters) {
