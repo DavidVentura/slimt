@@ -58,7 +58,11 @@ void* Aligned::allocate(size_t alignment, size_t size) {
     aligned_size += alignment;
   }
   assert(aligned_size >= size);
-  return aligned_alloc(alignment, aligned_size);
+  void* ptr = nullptr;
+  if (posix_memalign(&ptr, alignment, aligned_size) != 0) {
+    return nullptr;
+  }
+  return ptr;
 }
 
 void Aligned::release() {
