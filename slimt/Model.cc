@@ -201,11 +201,16 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
   // Cap each sentence's target length from its own (unpadded) source length.
   // A cap derived from the batch's padded length would let a sentence run
   // longer the longer its co-batched neighbours are, making the output
-  // depend on batch composition.
+  // depend on batch composition. The additive slack exists because a purely
+  // multiplicative cap starves short sources — "CHAPTER 102. A Bower in the
+  // Arsacides." is 16 subwords, and 1.5×16 = 24 truncated the Spanish
+  // mid-word ("...los Arsaci") — while barely moving the runaway bound for
+  // long ones.
+  constexpr size_t kTargetLengthSlack = 8;
   std::vector<size_t> target_caps(batch_size);
   for (size_t i = 0; i < batch_size; i++) {
-    size_t cap = input.limit_factor() * input.lengths()[i];
-    target_caps[i] = std::max<size_t>(cap, 1);
+    target_caps[i] =
+        input.limit_factor() * input.lengths()[i] + kTargetLengthSlack;
   }
   auto record = [eos, &complete, &target_caps](
                     const std::vector<size_t> &active_to_original, Words &step,
@@ -252,7 +257,10 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
   // arrives holding the now-dead encoder transients (encoder_out was cloned to
   // the heap), so reset before the first step reclaims that space.
   arena.reset();
-  size_t max_seq_length = input.limit_factor() * source_sequence_length;
+  // Loop bound only; must dominate every per-row cap (lengths[i] ≤ the
+  // padded source_sequence_length). Rows stop at their own cap via record().
+  size_t max_seq_length =
+      input.limit_factor() * source_sequence_length + kTargetLengthSlack;
 
   auto compact = [&]() {
     std::vector<size_t> keep;
