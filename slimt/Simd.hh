@@ -256,16 +256,17 @@ void softmax(const float* logits_in, size_t batch_size, size_t num_classes,
       for (size_t k = kWidth - tail; k < kWidth; ++k) sum_scalar += tmp[k];
     }
 
-    // Pass 3: normalize.
+    // Pass 3: normalize. The aligned region divides by vector; the tail
+    // divides by scalar over [aligned, num_classes) only. A back-shifted
+    // vector here would re-divide the (kWidth - tail) overlap lanes that the
+    // aligned loop already normalized, yielding exp/sum^2 for those elements.
     Element vsum_broadcast(sum_scalar);
     for (size_t i = 0; i < aligned; i += kWidth) {
       Element e = Ops<Width>::loadu(p + i);
       Ops<Width>::storeu(p + i, Ops<Width>::div(e, vsum_broadcast));
     }
-    if (tail > 0) {
-      size_t start = num_classes - kWidth;
-      Element e = Ops<Width>::loadu(p + start);
-      Ops<Width>::storeu(p + start, Ops<Width>::div(e, vsum_broadcast));
+    for (size_t i = aligned; i < num_classes; ++i) {
+      p[i] /= sum_scalar;
     }
   }
 }
