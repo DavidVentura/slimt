@@ -35,7 +35,7 @@ Input convert(const Batch &batch, uint32_t pad_id, float limit_factor) {
     input.add(segment);
   }
 
-  input.set_shortlist_words(batch.shortlist_words());
+  input.set_shortlist(batch.shortlist());
   input.finalize();
   return input;
 }

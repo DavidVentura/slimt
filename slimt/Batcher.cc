@@ -5,9 +5,10 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <set>
 #include <tuple>
-#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 
 #include "slimt/Macros.hh"
@@ -81,43 +82,62 @@ void Batch::clear() {
   max_length_ = 0;
 }
 
-std::shared_ptr<const Words> Batch::shortlist_words() const {
-  std::shared_ptr<const Words> single;
-  std::set<Word> merged;
-  size_t request_count = 0;
-  std::unordered_set<const Request *> seen;
-
+BatchShortlist Batch::shortlist() const {
+  std::vector<std::pair<const Request *, std::shared_ptr<const Words>>>
+      requests;
   for (const auto &segment_ref : segment_refs_) {
     const auto &request = segment_ref.request();
-    if (!seen.insert(request.get()).second) {
+    auto seen = std::find_if(
+        requests.begin(), requests.end(),
+        [&](const auto &entry) { return entry.first == request.get(); });
+    if (seen != requests.end()) {
       continue;
     }
 
     const auto &request_shortlist = request->shortlist_words();
     if (!request_shortlist) {
-      return nullptr;
+      // One unrestricted request makes the whole batch decode unrestricted;
+      // restricting only some rows would still need full-vocabulary logits.
+      return {};
     }
-
-    request_count++;
-    if (request_count == 1) {
-      single = request_shortlist;
-      continue;
-    }
-
-    if (request_count == 2 && single) {
-      merged.insert(single->begin(), single->end());
-      single.reset();
-    }
-    merged.insert(request_shortlist->begin(), request_shortlist->end());
+    requests.emplace_back(request.get(), request_shortlist);
   }
 
-  if (request_count == 0) {
-    return nullptr;
+  if (requests.empty()) {
+    return {};
   }
-  if (request_count == 1) {
-    return single;
+  if (requests.size() == 1) {
+    return {.words = requests.front().second, .rows = {}};
   }
-  return std::make_shared<const Words>(merged.begin(), merged.end());
+
+  std::set<Word> merged;
+  for (const auto &[request, request_words] : requests) {
+    merged.insert(request_words->begin(), request_words->end());
+  }
+  auto union_words = std::make_shared<const Words>(merged.begin(), merged.end());
+
+  // Each request's shortlist is sorted (ShortlistGenerator emits ascending
+  // ids) and so is the union, so the positions fall out of a linear merge.
+  std::unordered_map<const Request *, std::shared_ptr<const ShortlistPositions>>
+      positions;
+  for (const auto &[request, request_words] : requests) {
+    ShortlistPositions request_positions;
+    request_positions.reserve(request_words->size());
+    auto it = union_words->begin();
+    for (Word word : *request_words) {
+      it = std::lower_bound(it, union_words->end(), word);
+      request_positions.push_back(it - union_words->begin());
+    }
+    positions.emplace(request, std::make_shared<const ShortlistPositions>(
+                                   std::move(request_positions)));
+  }
+
+  std::vector<std::shared_ptr<const ShortlistPositions>> rows;
+  rows.reserve(segment_refs_.size());
+  for (const auto &segment_ref : segment_refs_) {
+    rows.push_back(positions.at(segment_ref.request().get()));
+  }
+  return {.words = std::move(union_words), .rows = std::move(rows)};
 }
 
 size_t AggregateBatcher::Hash::operator()(
@@ -151,11 +171,26 @@ Batch Batcher::generate() {
   Batch batch;
   size_t padded_batch_size = 0;
 
+  // Segments whose request has no shortlist decode over the full vocabulary;
+  // mixing them with shortlisted segments would force the whole batch onto
+  // the full-vocabulary output projection and make a sentence's translation
+  // depend on which other requests it was batched with. The first segment
+  // picks the batch's lane; foreign-lane segments stay queued for a later
+  // generate() call.
+  std::optional<bool> with_shortlist;
+
   for (size_t length = 0; length <= running_bucket_max_size_; length++) {
     auto p = bucket_[length].begin();
     while (p != bucket_[length].end()) {
+      bool segment_shortlisted =
+          p->request()->shortlist_words() != nullptr;
+      if (with_shortlist && segment_shortlisted != *with_shortlist) {
+        ++p;
+        continue;
+      }
       padded_batch_size = (batch.size() + 1) * length;
       if (padded_batch_size <= max_words_) {
+        with_shortlist = segment_shortlisted;
         auto q = p++;
         batch.add(*q);
         bucket_[length].erase(q);

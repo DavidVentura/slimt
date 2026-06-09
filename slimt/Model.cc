@@ -198,14 +198,26 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
   std::vector<bool> complete(batch_size, false);
   const Vocabulary &target_vocab = target_vocabulary();
   uint32_t eos = target_vocab.eos_id();
-  auto record = [eos, &complete](const std::vector<size_t> &active_to_original,
-                                 Words &step, Sentences &sentences) {
+  // Cap each sentence's target length from its own (unpadded) source length.
+  // A cap derived from the batch's padded length would let a sentence run
+  // longer the longer its co-batched neighbours are, making the output
+  // depend on batch composition.
+  std::vector<size_t> target_caps(batch_size);
+  for (size_t i = 0; i < batch_size; i++) {
+    size_t cap = input.limit_factor() * input.lengths()[i];
+    target_caps[i] = std::max<size_t>(cap, 1);
+  }
+  auto record = [eos, &complete, &target_caps](
+                    const std::vector<size_t> &active_to_original, Words &step,
+                    Sentences &sentences) {
     size_t finished = 0;
     for (size_t i = 0; i < step.size(); i++) {
       size_t original_id = active_to_original[i];
       if (not complete[original_id]) {
-        complete[original_id] = (step[i] == eos);
         sentences[original_id].push_back(step[i]);
+        complete[original_id] =
+            (step[i] == eos) ||
+            sentences[original_id].size() >= target_caps[original_id];
       }
     }
     for (bool done : complete) {
@@ -300,8 +312,9 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
                                        /*step_index=*/0);
 
     if (indices) {
-      previous_slice = greedy_sample_from_words(logits, target_vocab, *indices,
-                                                batch_size);
+      previous_slice = greedy_sample_from_words(
+          logits, target_vocab, *indices, input.shortlist_rows(),
+          active_to_original, batch_size);
     } else {
       previous_slice = greedy_sample(logits, target_vocab, batch_size);
     }
@@ -324,9 +337,9 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
                                          /*step_index=*/i);
       steps++;
       if (indices) {
-        previous_slice =
-            greedy_sample_from_words(logits, target_vocab, *indices,
-                                     active_to_original.size());
+        previous_slice = greedy_sample_from_words(
+            logits, target_vocab, *indices, input.shortlist_rows(),
+            active_to_original, active_to_original.size());
       } else {
         previous_slice =
             greedy_sample(logits, target_vocab, active_to_original.size());
