@@ -340,7 +340,7 @@ Tensor SSRU::forward(Tensor &state, const Tensor &x) const {
   Tensor y = relu(c_t);
 
   // h(t) = α LayerNorm(y(t) + x(t)) + β
-  Tensor h = ln_.forward(x + y);
+  Tensor h = ln_.forward_add(x, y);
 
   // The recurrent state outlives the current decoder step; copy c_t's data
   // into state's existing buffer instead of move-assigning a new one (which
@@ -374,10 +374,8 @@ std::tuple<Tensor, Tensor> DecoderLayer::forward(
   Tensor ffn1_out = ffn_[0].forward(out);
   Tensor ffn1_acts = relu(ffn1_out);
   Tensor ffn2_out = ffn_[1].forward(ffn1_acts);
-  Tensor y = add(ffn2_out, out);
-
-  // Post Norm
-  Tensor normalized_ffn_out = ffn_ffn_.forward(y);
+  // Post Norm (fused residual add)
+  Tensor normalized_ffn_out = ffn_ffn_.forward_add(ffn2_out, out);
   return std::make_tuple(std::move(normalized_ffn_out), std::move(attn));
 }
 
@@ -433,6 +431,10 @@ Tensor LayerNorm::forward(const Tensor &x) const {
   return y;
 }
 
+Tensor LayerNorm::forward_add(const Tensor &a, const Tensor &b) const {
+  return layer_norm_add(a, b, scale_, bias_);
+}
+
 std::tuple<Tensor, Tensor> Attention::forward(const Tensor &q, const Tensor &k,
                                               const Tensor &v,
                                               const Tensor &mask) const {
@@ -468,13 +470,9 @@ std::tuple<Tensor, Tensor> Attention::forward(
   // Project to output size.
   Tensor yo = affine(O_, out, "o");
 
-  // Add and norm
+  // Add and norm (fused residual add)
   const Tensor &x = q;
-  Tensor x_plus_y(x.type(), x.shape(), "x+y_(residual)");
-
-  add(x.data<float>(), yo.data<float>(), yo.size(), x_plus_y.data<float>());
-
-  Tensor y = ln_.forward(x_plus_y);
+  Tensor y = ln_.forward_add(x, yo);
 
   return std::make_tuple(std::move(y), std::move(attn));
 }
@@ -487,9 +485,8 @@ std::tuple<Tensor, Tensor> EncoderLayer::forward(const Tensor &x,
   Tensor ffn1_out = ffn_[0].forward(out);
   Tensor ffn1_acts = relu(ffn1_out);
   Tensor ffn2_out = ffn_[1].forward(ffn1_acts);
-  Tensor y = add(ffn2_out, out);
-  // Post Norm
-  Tensor normalized_ffn_out = ffn_ffn_.forward(y);
+  // Post Norm (fused residual add)
+  Tensor normalized_ffn_out = ffn_ffn_.forward_add(ffn2_out, out);
 
   return std::make_tuple(std::move(normalized_ffn_out), std::move(attention));
 }

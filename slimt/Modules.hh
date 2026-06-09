@@ -47,6 +47,7 @@ class LayerNorm {
   explicit LayerNorm() = default;
   void register_parameters(const std::string &prefix, ParameterMap &parameters);
   Tensor forward(const Tensor &x) const;
+  Tensor forward_add(const Tensor &a, const Tensor &b) const;  // layer_norm(a+b)
 
  private:
   Tensor bias_;

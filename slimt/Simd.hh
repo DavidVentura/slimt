@@ -180,6 +180,51 @@ void layer_norm(const float* in, const float* scale, const float* bias,
   }
 }
 
+// Fused residual + layer norm: out = layer_norm(a + b). The summed residual
+// feeds only the norm, so it is never materialized; a[j]+b[j] is recomputed
+// in each pass while the row stays hot in L1, saving the x_plus_y round-trip.
+template <VExt Width>
+void layer_norm_add(const float* a, const float* b, const float* scale,
+                    const float* bias, float eps, size_t rows, size_t cols,
+                    float* out) {
+  using Element = VDatum<Width>;
+  using Scalar = typename Ops<Width>::Scalar;
+  constexpr size_t kWidth = Element::kWidth;
+  size_t v_cols = cols / kWidth;
+
+  const auto* vscale = reinterpret_cast<const Element*>(scale);
+  const auto* vbias = reinterpret_cast<const Element*>(bias);
+  Scalar inv_cols = static_cast<Scalar>(1) / static_cast<Scalar>(cols);
+
+  for (size_t j = 0; j < rows; ++j) {
+    const auto* va = reinterpret_cast<const Element*>(a + j * cols);
+    const auto* vb = reinterpret_cast<const Element*>(b + j * cols);
+    auto* vy = reinterpret_cast<Element*>(out + j * cols);
+
+    Element vsum(0.0F);
+    for (size_t i = 0; i < v_cols; ++i) {
+      vsum = Ops<Width>::add(vsum, Ops<Width>::add(va[i], vb[i]));
+    }
+    Scalar mean = Ops<Width>::Reduce::sum(vsum) * inv_cols;
+    Element vmean(mean);
+
+    Element vsumsq(0.0F);
+    for (size_t i = 0; i < v_cols; ++i) {
+      Element centered = Ops<Width>::sub(Ops<Width>::add(va[i], vb[i]), vmean);
+      vsumsq = Ops<Width>::add(vsumsq, Ops<Width>::mul(centered, centered));
+    }
+    Scalar var = Ops<Width>::Reduce::sum(vsumsq) * inv_cols;
+    Element vinv_sigma(static_cast<Scalar>(1) / std::sqrt(var + eps));
+
+    for (size_t i = 0; i < v_cols; ++i) {
+      Element centered = Ops<Width>::sub(Ops<Width>::add(va[i], vb[i]), vmean);
+      Element normalized = Ops<Width>::mul(centered, vinv_sigma);
+      Element scaled = Ops<Width>::mul(normalized, vscale[i]);
+      vy[i] = Ops<Width>::add(scaled, vbias[i]);
+    }
+  }
+}
+
 template <VExt Width>
 void softmax(const float* logits_in, size_t batch_size, size_t num_classes,
              float* out_in) {

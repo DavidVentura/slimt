@@ -759,6 +759,56 @@ Tensor layer_norm(const Tensor& x, const Tensor& scale, const Tensor& bias,
   return y;
 }
 
+void layer_norm_add(const float* a, const float* b, const float* scale,
+                    const float* bias, float eps, size_t rows, size_t cols,
+                    float* out) {
+#ifdef VEXT_W8_AVAILABLE
+  if (cols % VDatum<VExt::w8>::kWidth == 0) {
+    vext::layer_norm_add<VExt::w8>(a, b, scale, bias, eps, rows, cols, out);
+    return;
+  }
+#endif
+#ifdef VEXT_W4_AVAILABLE
+  if (cols % VDatum<VExt::w4>::kWidth == 0) {
+    vext::layer_norm_add<VExt::w4>(a, b, scale, bias, eps, rows, cols, out);
+    return;
+  }
+#endif
+
+  for (size_t j = 0; j < rows; ++j) {
+    const float* a_row = a + j * cols;
+    const float* b_row = b + j * cols;
+    float* y = out + j * cols;
+
+    float sum = 0.0F;
+    for (size_t i = 0; i < cols; ++i) sum += a_row[i] + b_row[i];
+    float mean = sum / cols;
+
+    float square_sum_centered = 0.0F;
+    for (size_t i = 0; i < cols; ++i) {
+      float v = (a_row[i] + b_row[i]) - mean;
+      square_sum_centered += v * v;
+    }
+    float sigma = std::sqrt(square_sum_centered / cols + eps);
+
+    for (size_t i = 0; i < cols; ++i) {
+      y[i] = scale[i] * (((a_row[i] + b_row[i]) - mean) / sigma) + bias[i];
+    }
+  }
+}
+
+Tensor layer_norm_add(const Tensor& a, const Tensor& b, const Tensor& scale,
+                      const Tensor& bias, float EPS /*= 1e-6F*/) {
+  Tensor y = a.like("ln_out");
+  size_t cols = a.dim(-1);
+  size_t rows = a.size() / cols;
+
+  layer_norm_add(a.data<float>(), b.data<float>(),       //
+                 scale.data<float>(), bias.data<float>(),  //
+                 EPS, rows, cols, y.data<float>());
+  return y;
+}
+
 Tensor operator+(const Tensor& x, const Tensor& y) { return add(x, y); }
 Tensor operator-(const Tensor& x, const Tensor& y) { return sub(x, y); }
 Tensor operator*(const Tensor& x, const Tensor& y) { return mul(x, y); }
