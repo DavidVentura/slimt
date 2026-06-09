@@ -123,33 +123,24 @@ Tensor select_batch(const Tensor &tensor, const std::vector<size_t> &indices,
   return selected;
 }
 
-std::vector<Tensor> select_batch(const std::vector<Tensor> &tensors,
-                                 const std::vector<size_t> &indices) {
-  std::vector<Tensor> selected;
-  selected.reserve(tensors.size());
-  for (const Tensor &tensor : tensors) {
-    selected.push_back(select_batch(tensor, indices, tensor.name()));
+// In-place variant of select_batch for tensors the decode loop owns: `keep`
+// is ascending, so every kept slab moves to an offset at or before its
+// source within the same buffer. No fresh allocation means the pages stay
+// resident across compactions (a fresh heap tensor per finished sentence
+// showed up as ~4% of runtime in page-fault handling).
+void compact_batch(Tensor &tensor, const std::vector<size_t> &keep) {
+  size_t batch_size = tensor.dim(0);
+  size_t bytes_per_entry =
+      size_in_bytes(tensor.type()) * tensor.size() / batch_size;
+  char *data = tensor.data<char>();
+  for (size_t i = 0; i < keep.size(); ++i) {
+    if (keep[i] == i) {
+      continue;
+    }
+    std::memmove(data + i * bytes_per_entry, data + keep[i] * bytes_per_entry,
+                 bytes_per_entry);
   }
-  return selected;
-}
-
-AttentionContext select_batch(const AttentionContext &context,
-                              const std::vector<size_t> &indices) {
-  return {
-      .keys = select_batch(context.keys, indices, context.keys.name()),
-      .values = select_batch(context.values, indices, context.values.name()),
-  };
-}
-
-std::vector<AttentionContext> select_batch(
-    const std::vector<AttentionContext> &contexts,
-    const std::vector<size_t> &indices) {
-  std::vector<AttentionContext> selected;
-  selected.reserve(contexts.size());
-  for (const AttentionContext &context : contexts) {
-    selected.push_back(select_batch(context, indices));
-  }
-  return selected;
+  tensor.shape().set_dim(0, keep.size());
 }
 
 void update_alignment(const std::vector<size_t> &active_to_original,
@@ -278,13 +269,25 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
       return;
     }
 
-    selected_encoder_out =
-        select_batch(*active_encoder_out, keep, active_encoder_out->name());
-    selected_mask = select_batch(*active_mask, keep, active_mask->name());
-    active_encoder_out = &selected_encoder_out;
-    active_mask = &selected_mask;
-    states = select_batch(states, keep);
-    contexts = select_batch(contexts, keep);
+    if (active_encoder_out != &selected_encoder_out) {
+      // First shrink: encoder_out and mask are caller-owned consts, so the
+      // initial compaction copies them once; every later one is in place.
+      selected_encoder_out =
+          select_batch(*active_encoder_out, keep, active_encoder_out->name());
+      selected_mask = select_batch(*active_mask, keep, active_mask->name());
+      active_encoder_out = &selected_encoder_out;
+      active_mask = &selected_mask;
+    } else {
+      compact_batch(selected_encoder_out, keep);
+      compact_batch(selected_mask, keep);
+    }
+    for (Tensor &state : states) {
+      compact_batch(state, keep);
+    }
+    for (AttentionContext &context : contexts) {
+      compact_batch(context.keys, keep);
+      compact_batch(context.values, keep);
+    }
     active_to_original = std::move(next_active_to_original);
   };
 
