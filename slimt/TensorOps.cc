@@ -499,6 +499,55 @@ inline void matrix_multiply<Provider::Ruy>(  //
 
 constexpr Provider kChosenProvider = Provider::Ruy;
 
+#if defined(USE_NEON)
+namespace {
+// c[j] = alpha * dot(a[0..k), b + j*k)  for j in [0, n).
+// op(B) column-major (trans_b): output column j is a contiguous length-k row.
+void gemv_dot(const float* a, const float* b, size_t n, size_t k, float alpha,
+              float* c) {
+  for (size_t j = 0; j < n; ++j) {
+    const float* bj = b + j * k;
+    float32x4_t acc0 = vdupq_n_f32(0.0F);
+    float32x4_t acc1 = vdupq_n_f32(0.0F);
+    size_t p = 0;
+    for (; p + 8 <= k; p += 8) {
+      acc0 = vmlaq_f32(acc0, vld1q_f32(a + p), vld1q_f32(bj + p));
+      acc1 = vmlaq_f32(acc1, vld1q_f32(a + p + 4), vld1q_f32(bj + p + 4));
+    }
+    for (; p + 4 <= k; p += 4) {
+      acc0 = vmlaq_f32(acc0, vld1q_f32(a + p), vld1q_f32(bj + p));
+    }
+    float s = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; p < k; ++p) s += a[p] * bj[p];
+    c[j] = alpha * s;
+  }
+}
+
+// c[j] = alpha * sum_p a[p] * b[p*n + j]  for j in [0, n).
+// op(B) row-major: accumulate each contraction row p scaled by a[p].
+void gemv_acc(const float* a, const float* b, size_t n, size_t k, float alpha,
+              float* c) {
+  size_t j = 0;
+  for (; j + 4 <= n; j += 4) vst1q_f32(c + j, vdupq_n_f32(0.0F));
+  for (; j < n; ++j) c[j] = 0.0F;
+  for (size_t p = 0; p < k; ++p) {
+    const float32x4_t va = vdupq_n_f32(a[p]);
+    const float* bp = b + p * n;
+    for (j = 0; j + 4 <= n; j += 4) {
+      vst1q_f32(c + j, vmlaq_f32(vld1q_f32(c + j), va, vld1q_f32(bp + j)));
+    }
+    for (; j < n; ++j) c[j] += a[p] * bp[j];
+  }
+  if (alpha != 1.0F) {
+    for (j = 0; j + 4 <= n; j += 4) {
+      vst1q_f32(c + j, vmulq_n_f32(vld1q_f32(c + j), alpha));
+    }
+    for (; j < n; ++j) c[j] *= alpha;
+  }
+}
+}  // namespace
+#endif
+
 void batch_matrix_multiply(const float* A, const float* B, size_t batch_size,
                            size_t rows_a, size_t cols_a, size_t rows_b,
                            size_t cols_b, bool trans_a, bool trans_b,
@@ -535,6 +584,25 @@ void batch_matrix_multiply(const float* A, const float* B, size_t batch_size,
   size_t stride_c = m * n;
 
   float beta = 0.0;
+
+#if defined(USE_NEON)
+  // Decode-time fast path: query_length == 1 makes each per-head matmul a
+  // gemv. Ruy would pack both operands and run its 8-row kernel to produce a
+  // single row — almost all wasted. A direct gemv skips packing entirely.
+  if (m == 1 && !trans_a) {
+    for (size_t i = 0; i < batch_size; ++i) {
+      const float* a = A + i * stride_a;
+      const float* b = B + i * stride_b;
+      float* c = C + i * stride_c;
+      if (trans_b) {
+        gemv_dot(a, b, n, k, alpha, c);
+      } else {
+        gemv_acc(a, b, n, k, alpha, c);
+      }
+    }
+    return;
+  }
+#endif
 
   for (size_t i = 0; i < batch_size; ++i) {
     const float* a = A + i * stride_a;
