@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,12 @@ struct Response {
 /// text to be translated.
 struct Options {
   bool alignment{false};  ///< Include alignments or not.
+
+  /// Fired once per Request when it finishes translating, from the worker
+  /// thread. Used to report incremental progress without slicing the corpus
+  /// into many small translate() calls (which starves the batcher). Must be
+  /// non-blocking — workers call it inline between forward passes.
+  std::function<void()> on_progress{};
 };
 
 std::vector<Alignment> remap_alignments(const Response &first,

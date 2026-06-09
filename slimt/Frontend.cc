@@ -6,6 +6,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -233,6 +234,20 @@ Async::Async(const Config &config)
       Ptr<Model> model;
       std::tie(batch, model) = batcher_.generate();
       while (!batch.empty()) {
+        // Cancellation: skip the expensive forward() and abort the batch so
+        // each parent Request's promise still completes (otherwise the
+        // wrapper's drain would hang). Workers keep pulling and aborting the
+        // rest of the queue, so an in-flight translate unwinds within ~one
+        // batch per worker — whatever was already mid-forward when the flag
+        // flipped.
+        if (cancelled()) {
+          batch.abort(std::make_exception_ptr(
+              std::runtime_error("slimt: translation cancelled")));
+          batch = Batch();
+          model.reset();
+          std::tie(batch, model) = batcher_.generate();
+          continue;
+        }
         // Catch exceptions so the worker thread doesn't die, but propagate
         // them through the in-flight Requests' failure callbacks instead of
         // silently completing the batch with empty Histories. Each parent
@@ -265,8 +280,12 @@ Handle Async::translate(const Ptr<Model> &model, std::string source,
                         const Options &options) {
   auto promise = std::make_shared<Promise>();
   auto future = promise->get_future();
-  auto continuation = [promise](Response &&response) {
+  auto continuation = [promise, on_progress = options.on_progress](
+                          Response &&response) {
     promise->set_value(std::move(response));
+    if (on_progress) {
+      on_progress();
+    }
     return nullptr;
   };
   auto on_error = [promise](std::exception_ptr eptr) {
@@ -300,17 +319,23 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
   auto on_error = [promise](std::exception_ptr eptr) {
     promise->set_exception(std::move(eptr));
   };
-  auto continuation = [this, promise, second, with_alignment, on_error](
+  auto continuation = [this, promise, second, with_alignment, on_error,
+                       on_progress = options.on_progress](
                           Response &&partial) -> Ptr<Request> {
     AnnotatedText intermediate = partial.target;
     auto joining_continuation =
-        [source_to_pivot = std::move(partial),
-         promise](Response &&pivot_to_target) mutable -> Ptr<Request> {
+        [source_to_pivot = std::move(partial), promise,
+         on_progress](Response &&pivot_to_target) mutable -> Ptr<Request> {
       // We have both Responses at this callback, source_to_pivot is moved in,
       // second half will be available when complete.
       Response response =
           combine(std::move(source_to_pivot), std::move(pivot_to_target));
       promise->set_value(std::move(response));
+      // Fire once per input, when both legs are done — same per-input
+      // granularity as the direct translate path.
+      if (on_progress) {
+        on_progress();
+      }
       return nullptr;
     };
 
