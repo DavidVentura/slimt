@@ -17,6 +17,7 @@
 #include "slimt/Arena.hh"
 #include "slimt/Input.hh"
 #include "slimt/Io.hh"
+#include "slimt/QMM.hh"
 #include "slimt/Shortlist.hh"
 #include "slimt/Tensor.hh"
 #include "slimt/TensorOps.hh"
@@ -333,6 +334,12 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
     }
     compact();
   }
+
+  // The per-step output projection cached ruy packs of the shortlisted W
+  // (heap-owned, pointer-keyed cache); drop them before `shortlisted_output`
+  // is freed so a later allocation reusing the address can't hit a stale
+  // pack.
+  qmm::clear_standalone_pack_cache();
 
   if (std::getenv("SLIMT_DECODE_STATS") != nullptr) {
     size_t target_tokens = 0;

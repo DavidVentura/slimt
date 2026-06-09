@@ -48,6 +48,13 @@ template <enum Provider>
 void prepare_weight_quantized_transposed(const int8_t* input, int8_t* output,
                                          size_t rows, size_t cols);
 
+// Drops the calling thread's cached packs of heap-owned (standalone) weight
+// tensors. Must run before those tensors are freed — the cache is keyed by
+// data pointer, and a later allocation reusing the address would hit a stale
+// pack.
+template <enum Provider>
+void clear_standalone_pack_cache();
+
 }  // namespace detail
 
 Tensor affine(const Tensor& x, const Tensor& W, const Tensor& b, float a_quant,
@@ -72,5 +79,7 @@ void prepare_weight_transposed(const float* weights, int8_t* prepared,
                                size_t rows);
 void prepare_weight_quantized_transposed(const int8_t* input, int8_t* output,
                                          size_t rows, size_t cols);
+
+void clear_standalone_pack_cache();
 
 }  // namespace slimt::qmm

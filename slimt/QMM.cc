@@ -60,4 +60,10 @@ void prepare_weight_quantized_transposed(const int8_t* input, int8_t* output,
   prepare_weight_quantized_transposed<kProvider>(input, output, rows, cols);
 }
 
+void clear_standalone_pack_cache() {
+  using detail::clear_standalone_pack_cache;
+  using detail::kProvider;
+  clear_standalone_pack_cache<kProvider>();
+}
+
 }  // namespace slimt::qmm

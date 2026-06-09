@@ -6,6 +6,18 @@ namespace slimt::qmm::detail {
 
 using Index = uint64_t;
 
+namespace {
+ruy::Context& thread_context() {
+  thread_local ruy::Context context;
+  return context;
+}
+
+ruy::Context& standalone_thread_context() {
+  thread_local ruy::Context context;
+  return context;
+}
+}  // namespace
+
 void quantize(const float* input, float scale, Index rows, Index width,
               int8_t* output) {
   const Index size = rows * width;
@@ -76,7 +88,17 @@ Tensor affine<Provider::Ruy>(const Tensor& x, const Tensor& W, const Tensor& b,
   detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
                    prepared_A.data<int8_t>());
 
-  thread_local ruy::Context context;
+  // Ruy's pack cache is keyed by data pointer, so it is only safe while the
+  // pointer is stable. Mmap-backed model weights (`standalone() == false`)
+  // are stable for the model's lifetime and live in the never-cleared
+  // per-thread context. Heap-owned weights (SelectedAffine.W from
+  // select_columns) are decode-scoped — without caching, the per-step output
+  // projection repacks the same shortlisted W every step (~5% of runtime).
+  // Their packs go into a separate context that Model::decode clears before
+  // the tensors are freed, so a later allocation reusing the address can't
+  // hit a stale pack and the cache can't grow across decodes.
+  ruy::Context& context =
+      W.standalone() ? standalone_thread_context() : thread_context();
   ruy::Matrix<std::int8_t> lhs;
   ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
                         lhs.mutable_layout());
@@ -87,16 +109,7 @@ Tensor affine<Provider::Ruy>(const Tensor& x, const Tensor& W, const Tensor& b,
   ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
                         rhs.mutable_layout());
   rhs.set_data(W.data<int8_t>());
-  // Cache the RHS pack only when W's data pointer is model-lifetime stable.
-  // Mmap-backed model weights satisfy this (Tensor::load takes a View,
-  // never owns/frees the buffer — `standalone() == false`). Heap-owned
-  // tensors (e.g. SelectedAffine.W from select_columns) get freed at
-  // decode end; their address can be reused by the next decode's allocator
-  // call, and Ruy's pointer-keyed cache would then return a stale pack
-  // (garbage logits) plus grow unboundedly across decodes (OOM).
-  if (!W.standalone()) {
-    rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
-  }
+  rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
 
   // PrepareBias: ?
   // Actualyl there is no need.
@@ -169,7 +182,7 @@ Tensor dot<Provider::Ruy>(const Tensor& x, const Tensor& W, float a_quant,
   detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
                    prepared_A.data<int8_t>());
 
-  thread_local ruy::Context context;
+  ruy::Context& context = thread_context();
   ruy::Matrix<std::int8_t> lhs;
   ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
                         lhs.mutable_layout());
@@ -249,5 +262,10 @@ Tensor affine_with_prepared_bias<Provider::Ruy>(const Tensor& x,
                                                 float a_quant, float b_quant,
                                                 const std::string& name) {
   return affine<Provider::Ruy>(x, W, prepared_bias, a_quant, b_quant, name);
+}
+
+template <>
+void clear_standalone_pack_cache<Provider::Ruy>() {
+  standalone_thread_context().ClearPrepackedCache();
 }
 }  // namespace slimt::qmm::detail
