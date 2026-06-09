@@ -20,6 +20,7 @@ namespace slimt {
 
 class Input;
 class Tensor;
+class Arena;
 
 template <class Field>
 struct Package {
@@ -83,7 +84,8 @@ class SLIMT_EXPORT Model {
   }
 
  private:
-  Histories decode(const Tensor &encoder_out, const Input &input) const;
+  Histories decode(const Tensor &encoder_out, const Input &input,
+                   Arena &arena) const;
 
   static std::optional<ShortlistGenerator> make_shortlist_generator(
       View view, const Vocabulary &source, const Vocabulary &target);

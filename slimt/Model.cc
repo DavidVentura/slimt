@@ -176,7 +176,8 @@ void update_alignment(const std::vector<size_t> &active_to_original,
 }
 }  // namespace
 
-Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
+Histories Model::decode(const Tensor &encoder_out, const Input &input,
+                        Arena &arena) const {
   // Prepare a shortlist for the entire input.
   size_t batch_size = encoder_out.dim(-3);
   size_t source_sequence_length = encoder_out.dim(-2);
@@ -241,11 +242,11 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   size_t decoder_rows = active_to_original.size();
 
   // Per-step transient tensors (Q/K/V projections, attention scores, FFN
-  // intermediates, returned logits/attn) come from this arena; allocations
-  // that must outlive the step (states, contexts, encoder_out, select_batch
-  // outputs from compact) happen outside arena scopes.
-  constexpr size_t kArenaInitialBytes = 8 << 20;  // 8 MiB
-  static thread_local Arena arena(kArenaInitialBytes);
+  // intermediates, returned logits/attn) come from the shared scratch arena;
+  // allocations that must outlive the step (states, contexts, encoder_out,
+  // select_batch outputs from compact) happen outside arena scopes. The arena
+  // arrives holding the now-dead encoder transients (encoder_out was cloned to
+  // the heap), so reset before the first step reclaims that space.
   arena.reset();
   size_t max_seq_length = input.limit_factor() * source_sequence_length;
 
@@ -369,12 +370,13 @@ Histories Model::forward(const Input &input) const {
   // uint64_t sequence_length = indices.dim(-1);
   // uint64_t embed_dim = embedding_.dim(-1);
 
-  // Encoder transients (word embedding, per-layer Q/K/V/O and FFN
-  // projections, self-attention scores) come from a scratch arena so they
-  // don't bounce through the heap allocator. encoder_out is cloned out to the
-  // heap once the scope closes so it survives into decode().
-  constexpr size_t kEncoderArenaInitialBytes = 8 << 20;  // 8 MiB
-  static thread_local Arena arena(kEncoderArenaInitialBytes);
+  // One scratch arena per worker thread, shared by the encoder and the decode
+  // loop. Encoder transients (word embedding, per-layer Q/K/V/O and FFN
+  // projections, self-attention scores) come from it; encoder_out is cloned
+  // out to the heap once the scope closes so it survives into decode(), which
+  // then resets and reuses the same arena per step.
+  constexpr size_t kArenaInitialBytes = 8 << 20;  // 8 MiB
+  static thread_local Arena arena(kArenaInitialBytes);
   arena.reset();
   Tensor encoder_out;
   {
@@ -392,7 +394,7 @@ Histories Model::forward(const Input &input) const {
     encoder_out = arena_encoder_out.clone("encoder_out");
   }
 
-  Histories histories = decode(encoder_out, input);
+  Histories histories = decode(encoder_out, input, arena);
   return histories;
 }
 
