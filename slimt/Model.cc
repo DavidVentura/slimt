@@ -245,7 +245,8 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input) const {
   // that must outlive the step (states, contexts, encoder_out, select_batch
   // outputs from compact) happen outside arena scopes.
   constexpr size_t kArenaInitialBytes = 8 << 20;  // 8 MiB
-  Arena arena(kArenaInitialBytes);
+  static thread_local Arena arena(kArenaInitialBytes);
+  arena.reset();
   size_t max_seq_length = input.limit_factor() * source_sequence_length;
 
   auto compact = [&]() {
@@ -368,13 +369,29 @@ Histories Model::forward(const Input &input) const {
   // uint64_t sequence_length = indices.dim(-1);
   // uint64_t embed_dim = embedding_.dim(-1);
 
-  Tensor word_embedding =
-      index_select(transformer_.embedding(), indices, "word_embedding");
-  transform_embedding(word_embedding);
+  // Encoder transients (word embedding, per-layer Q/K/V/O and FFN
+  // projections, self-attention scores) come from a scratch arena so they
+  // don't bounce through the heap allocator. encoder_out is cloned out to the
+  // heap once the scope closes so it survives into decode().
+  constexpr size_t kEncoderArenaInitialBytes = 8 << 20;  // 8 MiB
+  static thread_local Arena arena(kEncoderArenaInitialBytes);
+  arena.reset();
+  Tensor encoder_out;
+  {
+    Tensor arena_encoder_out;
+    {
+      ArenaScope arena_scope(arena);
+      Tensor word_embedding =
+          index_select(transformer_.embedding(), indices, "word_embedding");
+      transform_embedding(word_embedding);
 
-  // https://github.com/browsermt/marian-dev/blob/14c9d9b0e732f42674e41ee138571d5a7bf7ad94/src/models/transformer.h#L570
-  // https://github.com/browsermt/marian-dev/blob/14c9d9b0e732f42674e41ee138571d5a7bf7ad94/src/models/transformer.h#L133
-  Tensor encoder_out = transformer_.encoder().forward(word_embedding, mask);
+      // https://github.com/browsermt/marian-dev/blob/14c9d9b0e732f42674e41ee138571d5a7bf7ad94/src/models/transformer.h#L570
+      // https://github.com/browsermt/marian-dev/blob/14c9d9b0e732f42674e41ee138571d5a7bf7ad94/src/models/transformer.h#L133
+      arena_encoder_out = transformer_.encoder().forward(word_embedding, mask);
+    }
+    encoder_out = arena_encoder_out.clone("encoder_out");
+  }
+
   Histories histories = decode(encoder_out, input);
   return histories;
 }
