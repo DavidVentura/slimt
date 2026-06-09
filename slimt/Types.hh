@@ -34,21 +34,14 @@ inline bool operator==(Range &a, Range b) {
 using Word = uint32_t;
 using Words = std::vector<Word>;
 
-// A batch's decode-time output vocabulary. `words` is the sorted union of
-// the shortlists of every request with a segment in the batch; `rows` holds,
-// per batch row, the positions in `words` that belong to that row's own
-// request (rows of one request share a list). Empty `rows` with non-null
-// `words` means every row may use all of `words` (single-request batch);
-// null `words` means no shortlist at all. Restricting each row to its own
-// request keeps a sentence's translation independent of whichever other
-// requests happened to be co-batched — batch composition varies with worker
-// timing, and an unrestricted union let junk candidates from unrelated
-// requests win the argmax.
-using ShortlistPositions = std::vector<uint32_t>;
-struct BatchShortlist {
-  std::shared_ptr<const Words> words;
-  std::vector<std::shared_ptr<const ShortlistPositions>> rows;
-};
+// Per batch row, the output-vocabulary candidates of the row's own request
+// (rows of one request share the same list); a null entry means that row's
+// request has no shortlist and decodes over the full vocabulary. Keeping
+// the candidates per row makes a sentence's translation independent of
+// whichever other requests happened to be co-batched — batch composition
+// varies with worker timing, and sampling from a batch-level union let junk
+// candidates from unrelated requests win the argmax.
+using RowShortlists = std::vector<std::shared_ptr<const Words>>;
 
 struct View {
   void *data = nullptr;

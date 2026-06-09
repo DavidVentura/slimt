@@ -35,18 +35,25 @@ class Decoder {
       const Tensor &encoder_out) const;
   std::vector<Tensor> start_states(size_t batch_size) const;
 
-  // Pre-compute the shortlisted output projection (selected columns of `W`
+  // Pre-compute a shortlisted output projection (selected columns of `W`
   // and the matching slice of `prepared_bias`) once for the whole decode.
-  // The returned snapshot is fed back into `step` on every iteration so the
-  // per-step path skips column-selection / bias-gather entirely.
+  // Model::decode builds one per request in the batch and applies it to that
+  // request's rows every step, so the per-step path skips column-selection /
+  // bias-gather entirely.
   SelectedAffine prepare_shortlisted_output(const Words &shortlist) const;
 
+  // Returns the final hidden state per active row (pre output-projection)
+  // and the guided-alignment attention. The output projection happens in
+  // Model::decode, grouped by each row's request shortlist.
   std::tuple<Tensor, Tensor> step(const Tensor &encoder_out, const Tensor &mask,
                                   std::vector<Tensor> &states,
                                   const std::vector<AttentionContext> &contexts,
                                   const Words &previous_step,
-                                  const SelectedAffine *shortlisted_output,
                                   size_t step_index = 0) const;
+
+  // Full-vocabulary output projection, for rows whose request carries no
+  // shortlist.
+  Tensor project(const Tensor &x) const;
 
  private:
   // Number of positions for which the sinusoidal table is precomputed at
@@ -67,10 +74,9 @@ class Vocabulary;
 
 Words greedy_sample(const Tensor &logits, const Vocabulary &vocabulary,
                     size_t batch_size);
-Words greedy_sample_from_words(
-    const Tensor &logits, const Vocabulary &vocabulary, const Words &words,
-    const std::vector<std::shared_ptr<const ShortlistPositions>> &rows,
-    const std::vector<size_t> &active_to_original, size_t batch_size);
+Words greedy_sample_from_words(const Tensor &logits,
+                               const Vocabulary &vocabulary, const Words &words,
+                               size_t batch_size);
 
 void transform_embedding(Tensor &word_embedding, size_t start = 0);
 void transform_embedding(Tensor &word_embedding, const Tensor &positions,

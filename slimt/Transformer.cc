@@ -191,8 +191,7 @@ SelectedAffine Decoder::prepare_shortlisted_output(
 std::tuple<Tensor, Tensor> Decoder::step(
     const Tensor &encoder_out, const Tensor &mask, std::vector<Tensor> &states,
     const std::vector<AttentionContext> &contexts,
-    const Words &previous_step, const SelectedAffine *shortlisted_output,
-    size_t step_index) const {
+    const Words &previous_step, size_t step_index) const {
   // Infer batch-size from encoder_out.
   size_t encoder_feature_dim = encoder_out.dim(-1);
   size_t source_sequence_length = encoder_out.dim(-2);
@@ -252,13 +251,11 @@ std::tuple<Tensor, Tensor> Decoder::step(
     }
   }
 
-  if (shortlisted_output) {
-    Tensor logits = affine_with_selected(*shortlisted_output, x, "logits");
-    return {std::move(logits), std::move(guided_alignment)};
-  }
+  return {std::move(x), std::move(guided_alignment)};
+}
 
-  Tensor logits = affine(output_, x, "logits");
-  return {std::move(logits), std::move(guided_alignment)};
+Tensor Decoder::project(const Tensor &x) const {
+  return affine(output_, x, "logits");
 }
 
 void Transformer::load_parameters() {
@@ -435,10 +432,9 @@ Words greedy_sample(const Tensor &logits, const Vocabulary &vocabulary,
   return sampled_words;
 }
 
-Words greedy_sample_from_words(
-    const Tensor &logits, const Vocabulary &vocabulary, const Words &words,
-    const std::vector<std::shared_ptr<const ShortlistPositions>> &rows,
-    const std::vector<size_t> &active_to_original, size_t batch_size) {
+Words greedy_sample_from_words(const Tensor &logits,
+                               const Vocabulary &vocabulary, const Words &words,
+                               size_t batch_size) {
   (void)vocabulary;
   size_t stride = words.size();
   Words sampled_words;
@@ -446,19 +442,6 @@ Words greedy_sample_from_words(
   const auto *data = logits.data<float>();
   for (size_t i = 0; i < batch_size; i++) {
     const float *row = data + i * stride;
-    if (!rows.empty()) {
-      // The logits cover the whole batch union, but each sentence may only
-      // sample candidates its own request shortlisted — see BatchShortlist.
-      const ShortlistPositions &positions = *rows[active_to_original[i]];
-      size_t best = positions[0];
-      for (uint32_t position : positions) {
-        if (row[position] > row[best]) {
-          best = position;
-        }
-      }
-      sampled_words.push_back(words[best]);
-      continue;
-    }
     size_t max_index = argmax(row, stride);
     sampled_words.push_back(words[max_index]);
     if (false) {  // NOLINT

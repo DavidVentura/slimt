@@ -2,6 +2,14 @@
 
 #include <cmath>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1UL << 20)
+#endif
+#endif
+
 namespace slimt::qmm::detail {
 
 using Index = uint64_t;
@@ -15,6 +23,91 @@ ruy::Context& thread_context() {
 ruy::Context& standalone_thread_context() {
   thread_local ruy::Context context;
   return context;
+}
+
+#if defined(__aarch64__)
+// Ruy's int8 kernel computes an 8-row block regardless of m, so a 1-row
+// multiply (the per-request output projection during decode: requests are
+// usually single sentences, so each group is one row) wastes ~8× the
+// arithmetic and packs both operands first. W is col-major, every column
+// contiguous, so a direct sdot gemv needs no packing and accumulates the
+// same exact int32 values. Detected at runtime; dotprod is armv8.2 and the
+// generic arm64 build can't assume it at compile time.
+bool dotprod_available() {
+  static const bool available = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+  return available;
+}
+
+__attribute__((target("dotprod"))) void gemv_i8_dotprod(
+    const int8_t* x, const int8_t* W, Index width, Index cols, int32_t* out) {
+  // Four columns per iteration: one shared x load feeds four independent
+  // sdot accumulator chains, otherwise the loop is bound by sdot's latency
+  // instead of its throughput.
+  Index j = 0;
+  for (; j + 4 <= cols; j += 4) {
+    const int8_t* c0 = W + (j + 0) * width;
+    const int8_t* c1 = W + (j + 1) * width;
+    const int8_t* c2 = W + (j + 2) * width;
+    const int8_t* c3 = W + (j + 3) * width;
+    int32x4_t acc0 = vdupq_n_s32(0);
+    int32x4_t acc1 = vdupq_n_s32(0);
+    int32x4_t acc2 = vdupq_n_s32(0);
+    int32x4_t acc3 = vdupq_n_s32(0);
+    Index k = 0;
+    for (; k + 16 <= width; k += 16) {
+      int8x16_t xv = vld1q_s8(x + k);
+      acc0 = vdotq_s32(acc0, xv, vld1q_s8(c0 + k));
+      acc1 = vdotq_s32(acc1, xv, vld1q_s8(c1 + k));
+      acc2 = vdotq_s32(acc2, xv, vld1q_s8(c2 + k));
+      acc3 = vdotq_s32(acc3, xv, vld1q_s8(c3 + k));
+    }
+    int32x4_t sums = vpaddq_s32(vpaddq_s32(acc0, acc1), vpaddq_s32(acc2, acc3));
+    for (; k < width; ++k) {
+      int32_t lane[4] = {c0[k], c1[k], c2[k], c3[k]};
+      sums = vaddq_s32(sums, vmulq_n_s32(vld1q_s32(lane), x[k]));
+    }
+    vst1q_s32(out + j, sums);
+  }
+  for (; j < cols; ++j) {
+    const int8_t* column = W + j * width;
+    int32x4_t acc = vdupq_n_s32(0);
+    Index k = 0;
+    for (; k + 16 <= width; k += 16) {
+      acc = vdotq_s32(acc, vld1q_s8(x + k), vld1q_s8(column + k));
+    }
+    int32_t sum = vaddvq_s32(acc);
+    for (; k < width; ++k) {
+      sum += x[k] * column[k];
+    }
+    out[j] = sum;
+  }
+}
+#endif
+
+// Threshold under which the row-at-a-time gemv beats ruy's padded 8-row
+// kernel (8-row block cost is flat in m, gemv cost is linear; crossover
+// is below 8 because ruy's kernel is better software-pipelined).
+constexpr Index kGemvRowLimit = 4;
+
+bool gemv(const int8_t* A, const int8_t* W, Index rows, Index width,
+          Index cols, int32_t* out) {
+#if defined(__aarch64__)
+  if (rows > kGemvRowLimit || !dotprod_available()) {
+    return false;
+  }
+  for (Index r = 0; r < rows; ++r) {
+    gemv_i8_dotprod(A + r * width, W, width, cols, out + r * cols);
+  }
+  return true;
+#else
+  (void)A;
+  (void)W;
+  (void)rows;
+  (void)width;
+  (void)cols;
+  (void)out;
+  return false;
+#endif
 }
 }  // namespace
 
@@ -88,46 +181,48 @@ Tensor affine<Provider::Ruy>(const Tensor& x, const Tensor& W, const Tensor& b,
   detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
                    prepared_A.data<int8_t>());
 
-  // Ruy's pack cache is keyed by data pointer, so it is only safe while the
-  // pointer is stable. Mmap-backed model weights (`standalone() == false`)
-  // are stable for the model's lifetime and live in the never-cleared
-  // per-thread context. Heap-owned weights (SelectedAffine.W from
-  // select_columns) are decode-scoped — without caching, the per-step output
-  // projection repacks the same shortlisted W every step (~5% of runtime).
-  // Their packs go into a separate context that Model::decode clears before
-  // the tensors are freed, so a later allocation reusing the address can't
-  // hit a stale pack and the cache can't grow across decodes.
-  ruy::Context& context =
-      W.standalone() ? standalone_thread_context() : thread_context();
-  ruy::Matrix<std::int8_t> lhs;
-  ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
-                        lhs.mutable_layout());
-  lhs.set_data(prepared_A.data<int8_t>());
+  Shape out_shape = x.shape();
+  out_shape.set_dim(-1, B_cols);
+  Tensor AB(Type::i32, out_shape, name + "_out");  // NOLINT
 
-  // PrepareB: ?
-  ruy::Matrix<std::int8_t> rhs;
-  ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
-                        rhs.mutable_layout());
-  rhs.set_data(W.data<int8_t>());
-  rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
+  if (!gemv(prepared_A.data<int8_t>(), W.data<int8_t>(), A_rows, width, B_cols,
+            AB.data<int32_t>())) {
+    // Ruy's pack cache is keyed by data pointer, so it is only safe while the
+    // pointer is stable. Mmap-backed model weights (`standalone() == false`)
+    // are stable for the model's lifetime and live in the never-cleared
+    // per-thread context. Heap-owned weights (SelectedAffine.W from
+    // select_columns) are decode-scoped — without caching, the per-step
+    // output projection repacks the same shortlisted W every step (~5% of
+    // runtime). Their packs go into a separate context that Model::decode
+    // clears before the tensors are freed, so a later allocation reusing the
+    // address can't hit a stale pack and the cache can't grow across decodes.
+    ruy::Context& context =
+        W.standalone() ? standalone_thread_context() : thread_context();
+    ruy::Matrix<std::int8_t> lhs;
+    ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
+                          lhs.mutable_layout());
+    lhs.set_data(prepared_A.data<int8_t>());
+
+    ruy::Matrix<std::int8_t> rhs;
+    ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
+                          rhs.mutable_layout());
+    rhs.set_data(W.data<int8_t>());
+    rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
+
+    ruy::Matrix<std::int32_t> dst;
+    ruy::MakeSimpleLayout(A_rows, B_cols, ruy::Order::kRowMajor,
+                          dst.mutable_layout());
+    dst.set_data(AB.data<int32_t>());
+
+    // Multiply C = AB;
+    // When Dst is int32, mul_params is unused.
+    ruy::MulParams<std::int32_t, std::int32_t> mul_params;
+    ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+  }
 
   // PrepareBias: ?
   // Actualyl there is no need.
   const Tensor& prepared_bias = bias;
-
-  ruy::Matrix<std::int32_t> dst;
-  ruy::MakeSimpleLayout(A_rows, B_cols, ruy::Order::kRowMajor,
-                        dst.mutable_layout());
-
-  Shape out_shape = x.shape();
-  out_shape.set_dim(-1, B_cols);
-  Tensor AB(Type::i32, out_shape, name + "_out");  // NOLINT
-  dst.set_data(AB.data<int32_t>());
-
-  // Multiply C = AB;
-  // When Dst is int32, mul_params is unused.
-  ruy::MulParams<std::int32_t, std::int32_t> mul_params;
-  ruy::Mul(lhs, rhs, mul_params, &context, &dst);
 
   // Unquantizes, then adds bias in a single statement on the output.
   Tensor y(Type::f32, out_shape, name + "_out");  // NOLINT
@@ -182,34 +277,34 @@ Tensor dot<Provider::Ruy>(const Tensor& x, const Tensor& W, float a_quant,
   detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
                    prepared_A.data<int8_t>());
 
-  ruy::Context& context = thread_context();
-  ruy::Matrix<std::int8_t> lhs;
-  ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
-                        lhs.mutable_layout());
-  lhs.set_data(prepared_A.data<int8_t>());
-
-  // PrepareB: ?
-  ruy::Matrix<std::int8_t> rhs;
-  ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
-                        rhs.mutable_layout());
-  rhs.set_data(W.data<int8_t>());
-  rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
-
-  // PrepareBias: ?
-  // Actualyl there is no need.
-  ruy::Matrix<std::int32_t> dst;
-  ruy::MakeSimpleLayout(A_rows, B_cols, ruy::Order::kRowMajor,
-                        dst.mutable_layout());
-
   Shape out_shape = x.shape();
   out_shape.set_dim(-1, B_cols);
   Tensor AB(Type::i32, out_shape, name + "_out");  // NOLINT
-  dst.set_data(AB.data<int32_t>());
 
-  // Multiply C = AB;
-  // When Dst is int32, mul_params is unused.
-  ruy::MulParams<std::int32_t, std::int32_t> mul_params;
-  ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+  if (!gemv(prepared_A.data<int8_t>(), W.data<int8_t>(), A_rows, width, B_cols,
+            AB.data<int32_t>())) {
+    ruy::Context& context = thread_context();
+    ruy::Matrix<std::int8_t> lhs;
+    ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
+                          lhs.mutable_layout());
+    lhs.set_data(prepared_A.data<int8_t>());
+
+    ruy::Matrix<std::int8_t> rhs;
+    ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
+                          rhs.mutable_layout());
+    rhs.set_data(W.data<int8_t>());
+    rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
+
+    ruy::Matrix<std::int32_t> dst;
+    ruy::MakeSimpleLayout(A_rows, B_cols, ruy::Order::kRowMajor,
+                          dst.mutable_layout());
+    dst.set_data(AB.data<int32_t>());
+
+    // Multiply C = AB;
+    // When Dst is int32, mul_params is unused.
+    ruy::MulParams<std::int32_t, std::int32_t> mul_params;
+    ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+  }
 
   // Unquantizes, then adds bias in a single statement on the output.
   Tensor y(Type::f32, out_shape, name + "_out");  // NOLINT

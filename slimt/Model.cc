@@ -170,30 +170,37 @@ void update_alignment(const std::vector<size_t> &active_to_original,
 
 Histories Model::decode(const Tensor &encoder_out, const Input &input,
                         Arena &arena) const {
-  // Prepare a shortlist for the entire input.
   size_t batch_size = encoder_out.dim(-3);
   size_t source_sequence_length = encoder_out.dim(-2);
 
-  std::optional<Words> indices = std::nullopt;
-  if (input.shortlist_words()) {
-    indices = *input.shortlist_words();
-  }
-  // The following can be used to check if shortlist is going wrong.
-  // std::vector<uint32_t> indices(target_vocab.size());
-  // std::iota(indices.begin(), indices.end(), 0);
+  const Decoder &decoder = transformer_.decoder();
 
-  // Lift the shortlisted output projection out of the per-step path. The
-  // shortlist is fixed for the whole decode, so the column-select on `W` and
-  // the matching gather on `prepared_bias` only need to run once. Built
-  // before the ArenaScope so the underlying tensors heap-allocate and
-  // survive across step iterations.
-  std::optional<SelectedAffine> shortlisted_output;
-  if (indices) {
-    shortlisted_output =
-        transformer_.decoder().prepare_shortlisted_output(*indices);
+  // One shortlisted output projection per distinct request in the batch
+  // (rows of one request share their shortlist's shared_ptr, so grouping is
+  // pointer equality). The column-select on `W` and the bias gather run once
+  // per decode; each step then multiplies a request's rows only against its
+  // own ~hundreds of candidates instead of a batch-wide union. A null entry
+  // is the full-vocabulary group, for rows whose request has no shortlist.
+  // Built before any ArenaScope so the tensors heap-allocate and survive
+  // across step iterations.
+  const RowShortlists &row_shortlists = input.shortlist_rows();
+  std::vector<std::shared_ptr<const Words>> group_words;
+  std::vector<SelectedAffine> group_selected;
+  std::vector<size_t> row_group(batch_size);
+  for (size_t i = 0; i < batch_size; i++) {
+    std::shared_ptr<const Words> words =
+        row_shortlists.empty() ? nullptr : row_shortlists[i];
+    size_t group = 0;
+    while (group < group_words.size() && group_words[group] != words) {
+      group++;
+    }
+    if (group == group_words.size()) {
+      group_words.push_back(words);
+      group_selected.push_back(words ? decoder.prepare_shortlisted_output(*words)
+                                     : SelectedAffine{});
+    }
+    row_group[i] = group;
   }
-  const SelectedAffine *shortlisted_output_ptr =
-      shortlisted_output ? &*shortlisted_output : nullptr;
 
   std::vector<bool> complete(batch_size, false);
   const Vocabulary &target_vocab = target_vocabulary();
@@ -235,7 +242,6 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
   Sentences sentences(batch_size);
   Alignments alignments(sentences.size());
 
-  const Decoder &decoder = transformer_.decoder();
   std::vector<size_t> active_to_original(batch_size);
   std::iota(active_to_original.begin(), active_to_original.end(), 0);
 
@@ -311,22 +317,63 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
     active_to_original = std::move(next_active_to_original);
   };
 
+  // Project the step's hidden states group by group and sample. Each
+  // group's rows are gathered into a contiguous slab (skipped when one
+  // group covers every active row, the common single-request case); the
+  // gathered slab and logits are step transients, so this must run inside
+  // the step's ArenaScope.
+  auto sample_step = [&](const Tensor &hidden) {
+    size_t active_rows = active_to_original.size();
+    size_t hidden_dim = hidden.dim(-1);
+    Words sampled(active_rows);
+
+    std::vector<std::vector<size_t>> members(group_words.size());
+    for (size_t i = 0; i < active_rows; ++i) {
+      members[row_group[active_to_original[i]]].push_back(i);
+    }
+
+    const float *hidden_data = hidden.data<float>();
+    for (size_t g = 0; g < members.size(); ++g) {
+      if (members[g].empty()) {
+        continue;
+      }
+      Tensor gathered;
+      const Tensor *x = &hidden;
+      if (members[g].size() != active_rows) {
+        gathered = Tensor(Type::f32, Shape({members[g].size(), 1, hidden_dim}),
+                          "grouped_hidden");
+        float *target = gathered.data<float>();
+        for (size_t j = 0; j < members[g].size(); ++j) {
+          const float *source = hidden_data + members[g][j] * hidden_dim;
+          std::copy(source, source + hidden_dim, target + j * hidden_dim);
+        }
+        x = &gathered;
+      }
+
+      Words group_sample;
+      if (group_words[g]) {
+        Tensor logits = affine_with_selected(group_selected[g], *x, "logits");
+        group_sample = greedy_sample_from_words(logits, target_vocab,
+                                                *group_words[g],
+                                                members[g].size());
+      } else {
+        Tensor logits = decoder.project(*x);
+        group_sample = greedy_sample(logits, target_vocab, members[g].size());
+      }
+      for (size_t j = 0; j < members[g].size(); ++j) {
+        sampled[members[g][j]] = group_sample[j];
+      }
+    }
+    return sampled;
+  };
+
   size_t remaining;
   {
     ArenaScope arena_scope(arena);
-    auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
+    auto [hidden, attn] = decoder.step(*active_encoder_out, *active_mask,
                                        states, contexts, previous_slice,
-                                       shortlisted_output_ptr,
                                        /*step_index=*/0);
-
-    if (indices) {
-      previous_slice = greedy_sample_from_words(
-          logits, target_vocab, *indices, input.shortlist_rows(),
-          active_to_original, batch_size);
-    } else {
-      previous_slice = greedy_sample(logits, target_vocab, batch_size);
-    }
-
+    previous_slice = sample_step(hidden);
     update_alignment(active_to_original, input.lengths(), complete, attn,
                      alignments);
     remaining = record(active_to_original, previous_slice, sentences);
@@ -339,19 +386,11 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
     decoder_rows += active_to_original.size();
     {
       ArenaScope arena_scope(arena);
-      auto [logits, attn] = decoder.step(*active_encoder_out, *active_mask,
+      auto [hidden, attn] = decoder.step(*active_encoder_out, *active_mask,
                                          states, contexts, previous_slice,
-                                         shortlisted_output_ptr,
                                          /*step_index=*/i);
       steps++;
-      if (indices) {
-        previous_slice = greedy_sample_from_words(
-            logits, target_vocab, *indices, input.shortlist_rows(),
-            active_to_original, active_to_original.size());
-      } else {
-        previous_slice =
-            greedy_sample(logits, target_vocab, active_to_original.size());
-      }
+      previous_slice = sample_step(hidden);
       update_alignment(active_to_original, input.lengths(), complete, attn,
                        alignments);
       remaining = record(active_to_original, previous_slice, sentences);
@@ -359,10 +398,10 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
     compact();
   }
 
-  // The per-step output projection cached ruy packs of the shortlisted W
-  // (heap-owned, pointer-keyed cache); drop them before `shortlisted_output`
-  // is freed so a later allocation reusing the address can't hit a stale
-  // pack.
+  // The per-step output projections cached ruy packs of the per-request
+  // shortlisted Ws (heap-owned, pointer-keyed cache); drop them before
+  // `group_selected` is freed so a later allocation reusing an address
+  // can't hit a stale pack.
   qmm::clear_standalone_pack_cache();
 
   if (std::getenv("SLIMT_DECODE_STATS") != nullptr) {
@@ -372,12 +411,17 @@ Histories Model::decode(const Tensor &encoder_out, const Input &input,
     }
     size_t wasted_rows =
         decoder_rows > target_tokens ? decoder_rows - target_tokens : 0;
+    size_t shortlisted_groups = 0;
+    for (const auto &words : group_words) {
+      shortlisted_groups += words ? 1 : 0;
+    }
     std::fprintf(stderr,
                  "[decode-stats] batch=%zu src_len=%zu steps=%zu rows=%zu "
-                 "target_tokens=%zu wasted_rows=%zu limit=%zu shortlist=%d\n",
+                 "target_tokens=%zu wasted_rows=%zu limit=%zu groups=%zu "
+                 "shortlisted_groups=%zu\n",
                  batch_size, source_sequence_length, steps, decoder_rows,
                  target_tokens, wasted_rows, max_seq_length,
-                 indices.has_value() ? 1 : 0);
+                 group_words.size(), shortlisted_groups);
   }
 
   Histories histories;

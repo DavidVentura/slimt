@@ -21,16 +21,8 @@ class Input {
   const Tensor &indices() const { return batch_; }
   const Tensor &mask() const { return mask_; }
   const std::vector<uint32_t> &words() const { return words_; }
-  void set_shortlist(BatchShortlist shortlist) {
-    shortlist_ = std::move(shortlist);
-  }
-  const std::shared_ptr<const Words> &shortlist_words() const {
-    return shortlist_.words;
-  }
-  const std::vector<std::shared_ptr<const ShortlistPositions>>
-      &shortlist_rows() const {
-    return shortlist_.rows;
-  }
+  void set_shortlist(RowShortlists rows) { shortlist_rows_ = std::move(rows); }
+  const RowShortlists &shortlist_rows() const { return shortlist_rows_; }
   const std::vector<size_t> &lengths() const { return lengths_; }
   size_t index() const { return index_; }
   float occupancy();
@@ -38,7 +30,7 @@ class Input {
 
  private:
   std::vector<uint32_t> words_;
-  BatchShortlist shortlist_;
+  RowShortlists shortlist_rows_;
   std::vector<size_t> lengths_;
   Tensor batch_;
   Tensor mask_;
