@@ -209,25 +209,35 @@ std::tuple<Tensor, Tensor> scaled_dot_product_attention(const Tensor &q,
       qkt.data<float>()                                //
   );
 
-  // SLIMT_TRACE(qkt.shape());
-  // SLIMT_TRACE(mask.shape());
-
-  // Add the mask for the tokens.
-  // Add without transposing etc using stride.
-  size_t batch_stride = (num_heads * query_length * value_length);
+  // softmax (QKT/d_k), restricted to each batch row's valid prefix. The
+  // mask is additive (0 for tokens, ~-1e8 for the padding suffix), so the
+  // padded attention weights come out exactly 0; softmax over the prefix
+  // plus a zero-filled tail computes the same values without materializing
+  // a mask-add pass over the full [B, heads, Tq, Tk] score tensor.
+  Tensor attn(v.type(), qkt.shape(), "sdpa_attn");
+  float *qkt_data = qkt.data<float>();
+  const float *mask_data = mask.data<float>();
+  float *attn_data = attn.data<float>();
   for (size_t batch_id = 0; batch_id < batch_size; batch_id++) {
-    float *data = qkt.data<float>() + batch_id * batch_stride;
-    const float *mask_data = mask.data<float>() + batch_id * value_length;
-    for (size_t offset = 0; offset < batch_stride; offset += value_length) {
-      float *data_begin = data + offset;
-      add(data_begin, mask_data, value_length, data_begin);
+    const float *mask_row = mask_data + batch_id * value_length;
+    size_t valid = value_length;
+    while (valid > 0 && mask_row[valid - 1] != 0.0F) {
+      valid--;
+    }
+    size_t rows = num_heads * query_length;
+    if (valid == value_length) {
+      // Length-bucketed batches are mostly unpadded; one batched call.
+      size_t offset = batch_id * rows * value_length;
+      softmax(qkt_data + offset, rows, value_length, attn_data + offset);
+      continue;
+    }
+    for (size_t r = 0; r < rows; ++r) {
+      size_t offset = (batch_id * rows + r) * value_length;
+      softmax(qkt_data + offset, 1, valid, attn_data + offset);
+      std::fill(attn_data + offset + valid, attn_data + offset + value_length,
+                0.0F);
     }
   }
-
-  // softmax (QKT/d_k)
-  Tensor attn(v.type(), qkt.shape(), "sdpa_attn");
-  softmax(qkt.data<float>(), reinterpreted_batch_size * query_length,
-          value_length, attn.data<float>());
 
   // softmax (QKT/d_k) * V
   Tensor out(q.type(), q.shape(), "sdpa_out");
