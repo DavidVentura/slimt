@@ -30,6 +30,25 @@ Tensor affine_with_prepared_bias(const Tensor& x, const Tensor& W,
                                               b_quant, name);
 }
 
+Tensor affine_relu_requantize(const Tensor& x, const Tensor& W,
+                              const Tensor& prepared_bias, float a_quant,
+                              float b_quant, float out_quant,
+                              const std::string& name) {
+  using detail::affine_relu_requantize;
+  using detail::kProvider;
+  return affine_relu_requantize<kProvider>(x, W, prepared_bias, a_quant,
+                                           b_quant, out_quant, name);
+}
+
+Tensor affine_quantized(const Tensor& x, const Tensor& W,
+                        const Tensor& prepared_bias, float a_quant,
+                        float b_quant, const std::string& name) {
+  using detail::affine_quantized;
+  using detail::kProvider;
+  return affine_quantized<kProvider>(x, W, prepared_bias, a_quant, b_quant,
+                                     name);
+}
+
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name) {
   using detail::kProvider;

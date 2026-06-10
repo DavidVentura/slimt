@@ -32,6 +32,22 @@ Tensor affine_with_prepared_bias(const Tensor& x, const Tensor& W,
                                  float b_quant,
                                  const std::string& name = "");
 
+// affine() whose epilogue is fused: the int32 accumulators are unquantized,
+// biased, relu'd and requantized with `out_quant` in one pass, returning the
+// i8 tensor a following affine_quantized() consumes directly. The f32
+// intermediate is never materialized.
+template <enum Provider>
+Tensor affine_relu_requantize(const Tensor& x, const Tensor& W,
+                              const Tensor& prepared_bias, float a_quant,
+                              float b_quant, float out_quant,
+                              const std::string& name = "");
+
+// affine() for an input already quantized with `a_quant`.
+template <enum Provider>
+Tensor affine_quantized(const Tensor& x, const Tensor& W,
+                        const Tensor& prepared_bias, float a_quant,
+                        float b_quant, const std::string& name = "");
+
 template <enum Provider>
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name = "");
@@ -67,6 +83,15 @@ Tensor affine_with_prepared_bias(const Tensor& x, const Tensor& W,
                                  const Tensor& prepared_bias, float a_quant,
                                  float b_quant,
                                  const std::string& name = "");
+
+Tensor affine_relu_requantize(const Tensor& x, const Tensor& W,
+                              const Tensor& prepared_bias, float a_quant,
+                              float b_quant, float out_quant,
+                              const std::string& name = "");
+
+Tensor affine_quantized(const Tensor& x, const Tensor& W,
+                        const Tensor& prepared_bias, float a_quant,
+                        float b_quant, const std::string& name = "");
 
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name = "");

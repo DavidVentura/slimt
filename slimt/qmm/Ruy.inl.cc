@@ -109,6 +109,44 @@ bool gemv(const int8_t* A, const int8_t* W, Index rows, Index width,
   return false;
 #endif
 }
+
+void multiply_i8(const int8_t* A, const Tensor& W, Index A_rows, Index width,
+                 Index B_cols, int32_t* out) {
+  if (gemv(A, W.data<int8_t>(), A_rows, width, B_cols, out)) {
+    return;
+  }
+
+  // Ruy's pack cache is keyed by data pointer, so it is only safe while the
+  // pointer is stable. Mmap-backed model weights (`standalone() == false`)
+  // are stable for the model's lifetime and live in the never-cleared
+  // per-thread context. Heap-owned weights (SelectedAffine.W from
+  // select_columns) are decode-scoped — without caching, the per-step
+  // output projection repacks the same shortlisted W every step (~5% of
+  // runtime). Their packs go into a separate context that Model::decode
+  // clears before the tensors are freed, so a later allocation reusing the
+  // address can't hit a stale pack and the cache can't grow across decodes.
+  ruy::Context& context =
+      W.standalone() ? standalone_thread_context() : thread_context();
+  ruy::Matrix<std::int8_t> lhs;
+  ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
+                        lhs.mutable_layout());
+  lhs.set_data(A);
+
+  ruy::Matrix<std::int8_t> rhs;
+  ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
+                        rhs.mutable_layout());
+  rhs.set_data(W.data<int8_t>());
+  rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
+
+  ruy::Matrix<std::int32_t> dst;
+  ruy::MakeSimpleLayout(A_rows, B_cols, ruy::Order::kRowMajor,
+                        dst.mutable_layout());
+  dst.set_data(out);
+
+  // When Dst is int32, mul_params is unused.
+  ruy::MulParams<std::int32_t, std::int32_t> mul_params;
+  ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+}
 }  // namespace
 
 void quantize(const float* input, float scale, Index rows, Index width,
@@ -158,6 +196,24 @@ void unquantizeAddBias(const int32_t* input, const float* input_bias_prepared,
   }
 }
 
+void unquantizeAddBiasReluQuantize(const int32_t* input,
+                                   const float* input_bias_prepared,
+                                   float unquant_multiplier,
+                                   float quant_multiplier, Index rows_A,
+                                   Index cols_B, int8_t* output) {
+  for (size_t i = 0; i < rows_A; i++) {
+    for (size_t j = 0; j < cols_B; j++) {
+      Index idx = i * cols_B + j;
+      float value =
+          (input[idx] * unquant_multiplier) + input_bias_prepared[j];
+      value = value > 0.0F ? value : 0.0F;
+      // No lower clamp: the relu already guarantees value >= 0.
+      value = std::min(roundf(value * quant_multiplier), kInt8Maxf);
+      output[idx] = static_cast<int8_t>(value);
+    }
+  }
+}
+
 // Ruy.
 template <>
 Tensor affine<Provider::Ruy>(const Tensor& x, const Tensor& W, const Tensor& b,
@@ -185,46 +241,66 @@ Tensor affine<Provider::Ruy>(const Tensor& x, const Tensor& W, const Tensor& b,
   out_shape.set_dim(-1, B_cols);
   Tensor AB(Type::i32, out_shape, name + "_out");  // NOLINT
 
-  if (!gemv(prepared_A.data<int8_t>(), W.data<int8_t>(), A_rows, width, B_cols,
-            AB.data<int32_t>())) {
-    // Ruy's pack cache is keyed by data pointer, so it is only safe while the
-    // pointer is stable. Mmap-backed model weights (`standalone() == false`)
-    // are stable for the model's lifetime and live in the never-cleared
-    // per-thread context. Heap-owned weights (SelectedAffine.W from
-    // select_columns) are decode-scoped — without caching, the per-step
-    // output projection repacks the same shortlisted W every step (~5% of
-    // runtime). Their packs go into a separate context that Model::decode
-    // clears before the tensors are freed, so a later allocation reusing the
-    // address can't hit a stale pack and the cache can't grow across decodes.
-    ruy::Context& context =
-        W.standalone() ? standalone_thread_context() : thread_context();
-    ruy::Matrix<std::int8_t> lhs;
-    ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
-                          lhs.mutable_layout());
-    lhs.set_data(prepared_A.data<int8_t>());
-
-    ruy::Matrix<std::int8_t> rhs;
-    ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
-                          rhs.mutable_layout());
-    rhs.set_data(W.data<int8_t>());
-    rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
-
-    ruy::Matrix<std::int32_t> dst;
-    ruy::MakeSimpleLayout(A_rows, B_cols, ruy::Order::kRowMajor,
-                          dst.mutable_layout());
-    dst.set_data(AB.data<int32_t>());
-
-    // Multiply C = AB;
-    // When Dst is int32, mul_params is unused.
-    ruy::MulParams<std::int32_t, std::int32_t> mul_params;
-    ruy::Mul(lhs, rhs, mul_params, &context, &dst);
-  }
+  multiply_i8(prepared_A.data<int8_t>(), W, A_rows, width, B_cols,
+              AB.data<int32_t>());
 
   // PrepareBias: ?
   // Actualyl there is no need.
   const Tensor& prepared_bias = bias;
 
   // Unquantizes, then adds bias in a single statement on the output.
+  Tensor y(Type::f32, out_shape, name + "_out");  // NOLINT
+  float unquant_multiplier = 1.0F / (a_quant * b_quant);
+  detail::unquantizeAddBias(AB.data<int32_t>(), prepared_bias.data<float>(),
+                            unquant_multiplier, A_rows, B_cols,
+                            y.data<float>());
+  return y;
+}
+
+template <>
+Tensor affine_relu_requantize<Provider::Ruy>(const Tensor& x, const Tensor& W,
+                                             const Tensor& prepared_bias,
+                                             float a_quant, float b_quant,
+                                             float out_quant,
+                                             const std::string& name) {
+  size_t A_cols = x.dim(-1);          // NOLINT
+  size_t B_cols = W.dim(-1);          // NOLINT
+  size_t A_rows = x.size() / A_cols;  // NOLINT
+  size_t width = W.size() / B_cols;
+
+  Tensor prepared_A(Type::i8, x.shape(), "prepared_A");  // NOLINT
+  detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
+                   prepared_A.data<int8_t>());
+
+  Shape out_shape = x.shape();
+  out_shape.set_dim(-1, B_cols);
+  Tensor AB(Type::i32, out_shape, name + "_acc");  // NOLINT
+  multiply_i8(prepared_A.data<int8_t>(), W, A_rows, width, B_cols,
+              AB.data<int32_t>());
+
+  Tensor y(Type::i8, out_shape, name + "_out");  // NOLINT
+  float unquant_multiplier = 1.0F / (a_quant * b_quant);
+  detail::unquantizeAddBiasReluQuantize(
+      AB.data<int32_t>(), prepared_bias.data<float>(), unquant_multiplier,
+      out_quant, A_rows, B_cols, y.data<int8_t>());
+  return y;
+}
+
+template <>
+Tensor affine_quantized<Provider::Ruy>(const Tensor& x, const Tensor& W,
+                                       const Tensor& prepared_bias,
+                                       float a_quant, float b_quant,
+                                       const std::string& name) {
+  size_t A_cols = x.dim(-1);          // NOLINT
+  size_t B_cols = W.dim(-1);          // NOLINT
+  size_t A_rows = x.size() / A_cols;  // NOLINT
+  size_t width = W.size() / B_cols;
+
+  Shape out_shape = x.shape();
+  out_shape.set_dim(-1, B_cols);
+  Tensor AB(Type::i32, out_shape, name + "_acc");  // NOLINT
+  multiply_i8(x.data<int8_t>(), W, A_rows, width, B_cols, AB.data<int32_t>());
+
   Tensor y(Type::f32, out_shape, name + "_out");  // NOLINT
   float unquant_multiplier = 1.0F / (a_quant * b_quant);
   detail::unquantizeAddBias(AB.data<int32_t>(), prepared_bias.data<float>(),
@@ -281,30 +357,8 @@ Tensor dot<Provider::Ruy>(const Tensor& x, const Tensor& W, float a_quant,
   out_shape.set_dim(-1, B_cols);
   Tensor AB(Type::i32, out_shape, name + "_out");  // NOLINT
 
-  if (!gemv(prepared_A.data<int8_t>(), W.data<int8_t>(), A_rows, width, B_cols,
-            AB.data<int32_t>())) {
-    ruy::Context& context = thread_context();
-    ruy::Matrix<std::int8_t> lhs;
-    ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
-                          lhs.mutable_layout());
-    lhs.set_data(prepared_A.data<int8_t>());
-
-    ruy::Matrix<std::int8_t> rhs;
-    ruy::MakeSimpleLayout(width, B_cols, ruy::Order::kColMajor,
-                          rhs.mutable_layout());
-    rhs.set_data(W.data<int8_t>());
-    rhs.set_cache_policy(ruy::CachePolicy::kAlwaysCache);
-
-    ruy::Matrix<std::int32_t> dst;
-    ruy::MakeSimpleLayout(A_rows, B_cols, ruy::Order::kRowMajor,
-                          dst.mutable_layout());
-    dst.set_data(AB.data<int32_t>());
-
-    // Multiply C = AB;
-    // When Dst is int32, mul_params is unused.
-    ruy::MulParams<std::int32_t, std::int32_t> mul_params;
-    ruy::Mul(lhs, rhs, mul_params, &context, &dst);
-  }
+  multiply_i8(prepared_A.data<int8_t>(), W, A_rows, width, B_cols,
+              AB.data<int32_t>());
 
   // Unquantizes, then adds bias in a single statement on the output.
   Tensor y(Type::f32, out_shape, name + "_out");  // NOLINT

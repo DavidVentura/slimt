@@ -371,9 +371,7 @@ std::tuple<Tensor, Tensor> DecoderLayer::forward(
 
   auto [out, attn] = attention_.forward(decoder_out, context, mask);
 
-  Tensor ffn1_out = ffn_[0].forward(out);
-  Tensor ffn1_acts = relu(ffn1_out);
-  Tensor ffn2_out = ffn_[1].forward(ffn1_acts);
+  Tensor ffn2_out = FFN::forward_chain(ffn_[0], ffn_[1], out);
   // Post Norm (fused residual add)
   Tensor normalized_ffn_out = ffn_ffn_.forward_add(ffn2_out, out);
   return std::make_tuple(std::move(normalized_ffn_out), std::move(attn));
@@ -400,6 +398,25 @@ void FFN::prepare_biases() { prepare_bias(O_); }
 Tensor FFN::forward(const Tensor &x) const {
   Tensor y = affine(O_, x, "ffn" + std::to_string(depth_));
   return y;
+}
+
+Tensor FFN::forward_chain(const FFN &first, const FFN &second,
+                          const Tensor &x) {
+  const Affine &f1 = first.O_;
+  const Affine &f2 = second.O_;
+  if (!f1.quant.loaded() || !f2.quant.loaded()) {
+    return second.forward(relu(first.forward(x)));
+  }
+
+  assert(f1.prepared_bias_ready && f2.prepared_bias_ready);
+  float a2_quant = f2.quant.item<float>();
+  Tensor intermediate = qmm::affine_relu_requantize(
+      x, f1.W, f1.prepared_bias, f1.quant.item<float>(),
+      retrieve_quantization_multiplier(f1.W), a2_quant,
+      "ffn" + std::to_string(first.depth_));
+  return qmm::affine_quantized(intermediate, f2.W, f2.prepared_bias, a2_quant,
+                               retrieve_quantization_multiplier(f2.W),
+                               "ffn" + std::to_string(second.depth_));
 }
 
 void Attention::prepare_biases() {
@@ -482,9 +499,7 @@ std::tuple<Tensor, Tensor> EncoderLayer::forward(const Tensor &x,
   // TODO(fill code):
   auto [out, attention] = attention_.forward(x, x, x, mask);
 
-  Tensor ffn1_out = ffn_[0].forward(out);
-  Tensor ffn1_acts = relu(ffn1_out);
-  Tensor ffn2_out = ffn_[1].forward(ffn1_acts);
+  Tensor ffn2_out = FFN::forward_chain(ffn_[0], ffn_[1], out);
   // Post Norm (fused residual add)
   Tensor normalized_ffn_out = ffn_ffn_.forward_add(ffn2_out, out);
 

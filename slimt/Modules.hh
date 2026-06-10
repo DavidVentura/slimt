@@ -94,6 +94,14 @@ class FFN {
   void prepare_biases();
   Tensor forward(const Tensor &x) const;
 
+  // second(relu(first(x))) with the intermediate kept quantized: first's
+  // epilogue applies bias, relu and second's input quantization in one pass
+  // over the int32 accumulators, so the widest tensor of the forward pass
+  // ([T × ffn_dim]) never round-trips through f32. Falls back to the
+  // three-pass form when either GEMM lacks a calibrated activation alpha.
+  static Tensor forward_chain(const FFN &first, const FFN &second,
+                              const Tensor &x);
+
  private:
   Affine O_;
   size_t depth_;
