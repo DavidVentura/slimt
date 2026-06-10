@@ -49,6 +49,18 @@ Tensor affine_quantized(const Tensor& x, const Tensor& W,
                                      name);
 }
 
+std::vector<Tensor> affine_segmented(const Tensor& x, const Tensor& W,
+                                     const Tensor& prepared_bias,
+                                     float a_quant,
+                                     const std::vector<float>& b_quants,
+                                     const std::vector<size_t>& segment_cols,
+                                     const std::string& name) {
+  using detail::affine_segmented;
+  using detail::kProvider;
+  return affine_segmented<kProvider>(x, W, prepared_bias, a_quant, b_quants,
+                                     segment_cols, name);
+}
+
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name) {
   using detail::kProvider;

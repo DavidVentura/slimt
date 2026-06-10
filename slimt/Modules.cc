@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -86,6 +87,97 @@ void prepare_bias(Affine &parameters) {
   parameters.prepared_bias_b_quant = b_quant;
   parameters.prepared_bias_ready = true;
 }
+
+namespace {
+
+struct ConcatSource {
+  const Tensor *W;
+  const Tensor *quant;
+  const Tensor *prepared_bias;  // nullptr: bias-less (linear) segment
+};
+
+ConcatAffine concat_affines(const std::vector<ConcatSource> &sources) {
+  ConcatAffine fused;
+  for (const ConcatSource &source : sources) {
+    if (!source.W->loaded() || !source.quant->loaded()) {
+      return fused;
+    }
+    if (source.quant->item<float>() != sources.front().quant->item<float>()) {
+      return fused;
+    }
+  }
+
+  size_t width = sources.front().W->size() / sources.front().W->dim(-1);
+  size_t total_cols = 0;
+  for (const ConcatSource &source : sources) {
+    if (source.W->size() / source.W->dim(-1) != width) {
+      return fused;
+    }
+    total_cols += source.W->dim(-1);
+  }
+
+  Shape shape({width, total_cols});
+  fused.storage = Tensor::allocate(Type::i8, shape);
+  fused.W.load(View{fused.storage.data(), width * total_cols}, Type::i8,
+               shape, "concat_W");
+  fused.prepared_bias =
+      Tensor(Type::f32, Shape({total_cols}), "concat_prepared_bias");
+
+  auto *w_out = fused.W.data<int8_t>();
+  auto *bias_out = fused.prepared_bias.data<float>();
+  for (const ConcatSource &source : sources) {
+    size_t cols = source.W->dim(-1);
+    std::memcpy(w_out, source.W->data<int8_t>(), width * cols);
+    w_out += width * cols;
+    if (source.prepared_bias != nullptr) {
+      std::memcpy(bias_out, source.prepared_bias->data<float>(),
+                  cols * sizeof(float));
+    } else {
+      std::fill(bias_out, bias_out + cols, 0.0F);
+    }
+    bias_out += cols;
+    fused.b_quants.push_back(retrieve_quantization_multiplier(*source.W));
+    fused.segment_cols.push_back(cols);
+  }
+  fused.a_quant = sources.front().quant->item<float>();
+  fused.valid = true;
+  return fused;
+}
+
+// Multiply x against the segments [first, first+count): col-major storage
+// makes any segment range a contiguous sub-block, viewed without copying.
+std::vector<Tensor> concat_forward(const ConcatAffine &fused, const Tensor &x,
+                                   size_t first, size_t count,
+                                   const std::string &name) {
+  size_t width = fused.W.dim(0);
+  size_t offset = 0;
+  for (size_t s = 0; s < first; ++s) {
+    offset += fused.segment_cols[s];
+  }
+  size_t cols = 0;
+  for (size_t s = first; s < first + count; ++s) {
+    cols += fused.segment_cols[s];
+  }
+
+  Tensor W;
+  W.load(View{const_cast<int8_t *>(fused.W.data<int8_t>()) + offset * width,
+              width * cols},
+         Type::i8, Shape({width, cols}), "concat_W");
+  Tensor prepared_bias;
+  prepared_bias.load(
+      View{const_cast<float *>(fused.prepared_bias.data<float>() + offset),
+           cols * sizeof(float)},
+      Type::f32, Shape({cols}), "concat_prepared_bias");
+
+  std::vector<float> b_quants(fused.b_quants.begin() + first,
+                              fused.b_quants.begin() + first + count);
+  std::vector<size_t> segment_cols(fused.segment_cols.begin() + first,
+                                   fused.segment_cols.begin() + first + count);
+  return qmm::affine_segmented(x, W, prepared_bias, fused.a_quant, b_quants,
+                               segment_cols, name);
+}
+
+}  // namespace
 
 std::tuple<Tensor, Tensor> scaled_dot_product_attention(const Tensor &q,
                                                         const Tensor &k,
@@ -327,8 +419,17 @@ Tensor SSRU::forward(Tensor &state, const Tensor &x) const {
   Tensor &c = state;  // Load context from saved-state.
 
   // Forward parameter multiplications.
-  Tensor f = affine(F_, x, "rnn_f");    // Forget gate? NOLINT
-  Tensor Wxt = linear(O_, x, "rnn_o");  // NOLINT
+  Tensor f;    // Forget gate? NOLINT
+  Tensor Wxt;  // NOLINT
+  if (fo_.valid) {
+    std::vector<Tensor> fo = concat_forward(fo_, x, /*first=*/0,
+                                            /*count=*/2, "rnn");
+    f = std::move(fo[0]);
+    Wxt = std::move(fo[1]);
+  } else {
+    f = affine(F_, x, "rnn_f");
+    Wxt = linear(O_, x, "rnn_o");
+  }
 
   // https://github.com/browsermt/marian-dev/blob/77e886ae7ae6016981c6307c312650bf74b50487/src/rnn/cells.h#L1058
   // c(t) = f(t) ⊙  c(t−1) + (1 − ft) ⊙  Wx(t)
@@ -424,9 +525,20 @@ void Attention::prepare_biases() {
   prepare_bias(K_);
   prepare_bias(V_);
   prepare_bias(O_);
+  qkv_ = concat_affines({{&Q_.W, &Q_.quant, &Q_.prepared_bias},
+                         {&K_.W, &K_.quant, &K_.prepared_bias},
+                         {&V_.W, &V_.quant, &V_.prepared_bias}});
+  if (!qkv_.valid) {
+    kv_ = concat_affines({{&K_.W, &K_.quant, &K_.prepared_bias},
+                          {&V_.W, &V_.quant, &V_.prepared_bias}});
+  }
 }
 
-void SSRU::prepare_biases() { prepare_bias(F_); }
+void SSRU::prepare_biases() {
+  prepare_bias(F_);
+  fo_ = concat_affines({{&F_.W, &F_.quant, &F_.prepared_bias},
+                        {&O_.W, &O_.quant, nullptr}});
+}
 
 void EncoderLayer::prepare_biases() {
   attention_.prepare_biases();
@@ -455,6 +567,17 @@ Tensor LayerNorm::forward_add(const Tensor &a, const Tensor &b) const {
 std::tuple<Tensor, Tensor> Attention::forward(const Tensor &q, const Tensor &k,
                                               const Tensor &v,
                                               const Tensor &mask) const {
+  if (qkv_.valid && q.data<float>() == k.data<float>() &&
+      k.data<float>() == v.data<float>()) {
+    std::vector<Tensor> qkv = concat_forward(qkv_, q, /*first=*/0,
+                                             /*count=*/3, "qkv");
+    AttentionContext context{
+        .keys = split_heads(qkv[1], num_heads_),
+        .values = split_heads(qkv[2], num_heads_),
+    };
+    return forward_split(q, split_heads(qkv[0], num_heads_), context, mask);
+  }
+
   AttentionContext context = prepare_context(k, v);
   return forward(q, context, mask);
 }
@@ -462,6 +585,25 @@ std::tuple<Tensor, Tensor> Attention::forward(const Tensor &q, const Tensor &k,
 AttentionContext Attention::prepare_context(const Tensor &k,
                                             const Tensor &v) const {
   // We have a B x T x H sequence coming in, for q, k and v.
+  if (k.data<float>() == v.data<float>()) {
+    if (qkv_.valid) {
+      std::vector<Tensor> kv = concat_forward(qkv_, k, /*first=*/1,
+                                              /*count=*/2, "kv");
+      return {
+          .keys = split_heads(kv[0], num_heads_),
+          .values = split_heads(kv[1], num_heads_),
+      };
+    }
+    if (kv_.valid) {
+      std::vector<Tensor> kv = concat_forward(kv_, k, /*first=*/0,
+                                              /*count=*/2, "kv");
+      return {
+          .keys = split_heads(kv[0], num_heads_),
+          .values = split_heads(kv[1], num_heads_),
+      };
+    }
+  }
+
   Tensor yk = affine(K_, k, "k");
   Tensor yv = affine(V_, v, "v");
 
@@ -475,8 +617,12 @@ std::tuple<Tensor, Tensor> Attention::forward(
     const Tensor &q, const AttentionContext &context,
     const Tensor &mask) const {
   Tensor yq = affine(Q_, q, "q");
-  Tensor split_yq = split_heads(yq, num_heads_);
+  return forward_split(q, split_heads(yq, num_heads_), context, mask);
+}
 
+std::tuple<Tensor, Tensor> Attention::forward_split(
+    const Tensor &q, Tensor split_yq, const AttentionContext &context,
+    const Tensor &mask) const {
   // Apply individual scaled-dot-product-attention (SDPA)
   auto [attn_out, attn] = scaled_dot_product_attention(
       split_yq, context.keys, context.values, mask);

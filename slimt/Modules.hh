@@ -37,6 +37,25 @@ struct Linear {
   Tensor quant;
 };
 
+// Column-concatenation of weight matrices that consume the same input
+// tensor. Marian's calibration derives a GEMM's activation alpha from its
+// input activations, so Affines sharing an input share an alpha (this holds
+// exactly across the shipped models, verified for enes/enja/jaen), and one
+// quantize + one multiply serves all of them. `W` views the module-owned
+// `storage`, so its data pointer is stable for the model's lifetime and qmm
+// caches its pack persistently. Built in prepare_biases(); `valid` stays
+// false when alphas are missing or disagree and callers fall back to
+// per-Affine multiplies.
+struct ConcatAffine {
+  Aligned storage;
+  Tensor W;
+  Tensor prepared_bias;
+  float a_quant = 0.0F;
+  std::vector<float> b_quants;
+  std::vector<size_t> segment_cols;
+  bool valid = false;
+};
+
 struct AttentionContext {
   Tensor keys;
   Tensor values;
@@ -67,8 +86,18 @@ class Attention {
                                      const Tensor &mask) const;
 
  private:
+  std::tuple<Tensor, Tensor> forward_split(const Tensor &q, Tensor split_yq,
+                                           const AttentionContext &context,
+                                           const Tensor &mask) const;
+
   std::string name_;
   Affine Q_, K_, V_, O_;
+  // Self-attention consumes one tensor for q/k/v, so all three fuse. For
+  // cross-attention Q's input (decoder state) differs from K/V's
+  // (encoder_out), so only the K|V pair shares an alpha; kv_ is built when
+  // the three-way fusion is rejected.
+  ConcatAffine qkv_;
+  ConcatAffine kv_;
   LayerNorm ln_;
   size_t num_heads_;
 };
@@ -84,6 +113,7 @@ class SSRU {
  private:
   Affine F_;
   Linear O_;
+  ConcatAffine fo_;
   LayerNorm ln_;
 };
 

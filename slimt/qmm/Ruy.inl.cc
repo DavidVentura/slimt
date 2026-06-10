@@ -110,23 +110,13 @@ bool gemv(const int8_t* A, const int8_t* W, Index rows, Index width,
 #endif
 }
 
-void multiply_i8(const int8_t* A, const Tensor& W, Index A_rows, Index width,
-                 Index B_cols, int32_t* out) {
+void multiply_i8_in(const int8_t* A, const Tensor& W, Index A_rows,
+                    Index width, Index B_cols, int32_t* out,
+                    ruy::Context& context) {
   if (gemv(A, W.data<int8_t>(), A_rows, width, B_cols, out)) {
     return;
   }
 
-  // Ruy's pack cache is keyed by data pointer, so it is only safe while the
-  // pointer is stable. Mmap-backed model weights (`standalone() == false`)
-  // are stable for the model's lifetime and live in the never-cleared
-  // per-thread context. Heap-owned weights (SelectedAffine.W from
-  // select_columns) are decode-scoped — without caching, the per-step
-  // output projection repacks the same shortlisted W every step (~5% of
-  // runtime). Their packs go into a separate context that Model::decode
-  // clears before the tensors are freed, so a later allocation reusing the
-  // address can't hit a stale pack and the cache can't grow across decodes.
-  ruy::Context& context =
-      W.standalone() ? standalone_thread_context() : thread_context();
   ruy::Matrix<std::int8_t> lhs;
   ruy::MakeSimpleLayout(A_rows, width, ruy::Order::kRowMajor,
                         lhs.mutable_layout());
@@ -146,6 +136,22 @@ void multiply_i8(const int8_t* A, const Tensor& W, Index A_rows, Index width,
   // When Dst is int32, mul_params is unused.
   ruy::MulParams<std::int32_t, std::int32_t> mul_params;
   ruy::Mul(lhs, rhs, mul_params, &context, &dst);
+}
+
+void multiply_i8(const int8_t* A, const Tensor& W, Index A_rows, Index width,
+                 Index B_cols, int32_t* out) {
+  // Ruy's pack cache is keyed by data pointer, so it is only safe while the
+  // pointer is stable. Mmap-backed model weights (`standalone() == false`)
+  // are stable for the model's lifetime and live in the never-cleared
+  // per-thread context. Heap-owned weights (SelectedAffine.W from
+  // select_columns) are decode-scoped — without caching, the per-step
+  // output projection repacks the same shortlisted W every step (~5% of
+  // runtime). Their packs go into a separate context that Model::decode
+  // clears before the tensors are freed, so a later allocation reusing the
+  // address can't hit a stale pack and the cache can't grow across decodes.
+  ruy::Context& context =
+      W.standalone() ? standalone_thread_context() : thread_context();
+  multiply_i8_in(A, W, A_rows, width, B_cols, out, context);
 }
 }  // namespace
 
@@ -284,6 +290,53 @@ Tensor affine_relu_requantize<Provider::Ruy>(const Tensor& x, const Tensor& W,
       AB.data<int32_t>(), prepared_bias.data<float>(), unquant_multiplier,
       out_quant, A_rows, B_cols, y.data<int8_t>());
   return y;
+}
+
+template <>
+std::vector<Tensor> affine_segmented<Provider::Ruy>(
+    const Tensor& x, const Tensor& W, const Tensor& prepared_bias,
+    float a_quant, const std::vector<float>& b_quants,
+    const std::vector<size_t>& segment_cols, const std::string& name) {
+  size_t A_cols = x.dim(-1);          // NOLINT
+  size_t B_cols = W.dim(-1);          // NOLINT
+  size_t A_rows = x.size() / A_cols;  // NOLINT
+  size_t width = W.size() / B_cols;
+
+  Tensor prepared_A(Type::i8, x.shape(), "prepared_A");  // NOLINT
+  detail::quantize(x.data<float>(), a_quant, A_rows, A_cols,
+                   prepared_A.data<int8_t>());
+
+  Shape acc_shape = x.shape();
+  acc_shape.set_dim(-1, B_cols);
+  Tensor AB(Type::i32, acc_shape, name + "_acc");  // NOLINT
+  // The concatenated weights live in module-owned storage that is stable for
+  // the model's lifetime, so the pack belongs in the persistent context.
+  multiply_i8_in(prepared_A.data<int8_t>(), W, A_rows, width, B_cols,
+                 AB.data<int32_t>(), thread_context());
+
+  std::vector<Tensor> outputs;
+  outputs.reserve(segment_cols.size());
+  const auto* acc = AB.data<int32_t>();
+  const auto* bias = prepared_bias.data<float>();
+  size_t offset = 0;
+  for (size_t s = 0; s < segment_cols.size(); ++s) {
+    size_t cols = segment_cols[s];
+    Shape out_shape = x.shape();
+    out_shape.set_dim(-1, cols);
+    Tensor y(Type::f32, out_shape, name + "_out");  // NOLINT
+    float unquant_multiplier = 1.0F / (a_quant * b_quants[s]);
+    auto* out = y.data<float>();
+    for (size_t i = 0; i < A_rows; ++i) {
+      const int32_t* row = acc + i * B_cols + offset;
+      const float* bias_row = bias + offset;
+      for (size_t j = 0; j < cols; ++j) {
+        out[i * cols + j] = (row[j] * unquant_multiplier) + bias_row[j];
+      }
+    }
+    outputs.push_back(std::move(y));
+    offset += cols;
+  }
+  return outputs;
 }
 
 template <>

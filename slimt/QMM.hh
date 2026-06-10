@@ -48,6 +48,20 @@ Tensor affine_quantized(const Tensor& x, const Tensor& W,
                         const Tensor& prepared_bias, float a_quant,
                         float b_quant, const std::string& name = "");
 
+// One multiply of x against a column-concatenation of weight matrices that
+// share x's quantized form (their calibrated activation alphas are equal
+// because they consume the same tensor). x is quantized once, multiplied
+// once, and each segment is dequantized with its own weight multiplier into
+// its own output tensor. `W` must have model-lifetime-stable storage: its
+// pack is cached in the persistent per-thread context.
+template <enum Provider>
+std::vector<Tensor> affine_segmented(const Tensor& x, const Tensor& W,
+                                     const Tensor& prepared_bias,
+                                     float a_quant,
+                                     const std::vector<float>& b_quants,
+                                     const std::vector<size_t>& segment_cols,
+                                     const std::string& name = "");
+
 template <enum Provider>
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name = "");
@@ -92,6 +106,13 @@ Tensor affine_relu_requantize(const Tensor& x, const Tensor& W,
 Tensor affine_quantized(const Tensor& x, const Tensor& W,
                         const Tensor& prepared_bias, float a_quant,
                         float b_quant, const std::string& name = "");
+
+std::vector<Tensor> affine_segmented(const Tensor& x, const Tensor& W,
+                                     const Tensor& prepared_bias,
+                                     float a_quant,
+                                     const std::vector<float>& b_quants,
+                                     const std::vector<size_t>& segment_cols,
+                                     const std::string& name = "");
 
 Tensor select_columns(const Tensor& W, const std::vector<uint32_t>& indices,
                       const std::string& name = "");
