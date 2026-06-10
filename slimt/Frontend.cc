@@ -83,11 +83,9 @@ Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
       context_words.insert(context_words.end(), segment.begin(), segment.end());
     }
 
-    auto shortlist = model->shortlist_generator()->generate(
+    Shortlist shortlist = model->shortlist_generator()->generate(
         context_words, ShortlistGenerator::kMinCandidates);
-    if (shortlist) {
-      shortlist_words = std::make_shared<const Words>(shortlist->words());
-    }
+    shortlist_words = std::make_shared<const Words>(shortlist.words());
   }
 
   auto request = std::make_shared<Request>(      //

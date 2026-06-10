@@ -138,7 +138,8 @@ ShortlistGenerator::ShortlistGenerator(                        //
   (void)source_index_;
 }
 
-Shortlist ShortlistGenerator::generate(const Words& words) const {
+Shortlist ShortlistGenerator::generate(const Words& words,
+                                       size_t min_candidates) const {
   size_t source_size = source_.size();
   size_t target_size = target_.size();
 
@@ -178,10 +179,13 @@ Shortlist ShortlistGenerator::generate(const Words& words) const {
     }
   }
 
-  // Ensure that the generated vocabulary items from a shortlist are a
-  // multiple of the vector extension alignment.
+  // Top up to min_candidates with the next-most-frequent ids, and ensure
+  // the generated vocabulary items are a multiple of the vector extension
+  // alignment.
   for (size_t i = frequent_;
-       i < target_size && target_table_ones % kVExtAlignment != 0; i++) {
+       i < target_size && (target_table_ones < min_candidates ||
+                           target_table_ones % kVExtAlignment != 0);
+       i++) {
     if (!target_table[i]) {
       target_table[i] = true;
       target_table_ones++;
@@ -199,13 +203,6 @@ Shortlist ShortlistGenerator::generate(const Words& words) const {
   return Shortlist(std::move(indices));
 }
 
-std::optional<Shortlist> ShortlistGenerator::generate(
-    const Words& words, size_t min_candidates) const {
-  Shortlist shortlist = generate(words);
-  if (shortlist.words().size() < min_candidates) {
-    return std::nullopt;
-  }
-  return shortlist;
-}
+
 
 }  // namespace slimt
