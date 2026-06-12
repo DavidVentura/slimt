@@ -38,7 +38,7 @@ bool dotprod_available() {
   return available;
 }
 
-__attribute__((target("dotprod"))) void gemv_i8_dotprod(
+__attribute__((target("+dotprod"))) void gemv_i8_dotprod(
     const int8_t* x, const int8_t* W, Index width, Index cols, int32_t* out) {
   // Four columns per iteration: one shared x load feeds four independent
   // sdot accumulator chains, otherwise the loop is bound by sdot's latency
