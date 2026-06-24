@@ -84,8 +84,17 @@ class SLIMT_EXPORT Model {
   }
 
  private:
-  Histories decode(const Tensor &encoder_out, const Input &input,
-                   Arena &arena) const;
+  // Greedy/selective decode over a batch. `mask`, `shortlist_rows`, `lengths`
+  // and `limit_factor` are the per-row inputs (passed explicitly, not as an
+  // Input, so a flagged subset can be re-decoded). With `selective`, low-
+  // confidence forks are resolved by short look-ahead roll-outs (single-row
+  // path). When `out_deficits` is non-null it receives each sentence's worst
+  // contiguous log-prob deficit — the two-pass router's flag signal.
+  Histories decode(const Tensor &encoder_out, const Tensor &mask,
+                   const RowShortlists &shortlist_rows,
+                   const std::vector<size_t> &lengths, float limit_factor,
+                   Arena &arena, bool selective,
+                   std::vector<double> *out_deficits) const;
 
   static std::optional<ShortlistGenerator> make_shortlist_generator(
       View view, const Vocabulary &source, const Vocabulary &target);
