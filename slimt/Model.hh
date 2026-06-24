@@ -96,6 +96,18 @@ class SLIMT_EXPORT Model {
                    Arena &arena, bool selective,
                    std::vector<double> *out_deficits) const;
 
+  // Batched beam decode over `S` sentences with a per-sentence width
+  // (`beam_widths[s]`). All Σ widths hypotheses step in one fused batched
+  // decode (each sentence's beams share its encoder row via replication; the
+  // SSRU states are gathered by surviving parent each step). Used by the
+  // two-pass router to re-decode flagged sentences. Returns one Hypothesis per
+  // sentence (best by length-normalized score).
+  Histories decode_beam(const Tensor &encoder_out, const Tensor &mask,
+                        const RowShortlists &shortlist_rows,
+                        const std::vector<size_t> &lengths,
+                        const std::vector<size_t> &beam_widths,
+                        float limit_factor, Arena &arena) const;
+
   static std::optional<ShortlistGenerator> make_shortlist_generator(
       View view, const Vocabulary &source, const Vocabulary &target);
 

@@ -608,6 +608,227 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
   return histories;
 }
 
+Histories Model::decode_beam(const Tensor &encoder_out, const Tensor &mask,
+                             const RowShortlists &row_shortlists,
+                             const std::vector<size_t> &lengths,
+                             const std::vector<size_t> &beam_widths,
+                             float limit_factor, Arena &arena) const {
+  size_t num_sentences = encoder_out.dim(-3);
+  size_t source_sequence_length = encoder_out.dim(-2);
+  const Decoder &decoder = transformer_.decoder();
+  const Vocabulary &target_vocab = target_vocabulary();
+  auto eos = static_cast<uint32_t>(target_vocab.eos_id());
+
+  // Replicate each sentence's row into its beam rows. `sentence_of[r]` maps a
+  // beam row back to its sentence; `rows_of[s]` lists a sentence's beam rows.
+  std::vector<size_t> rep;
+  std::vector<size_t> sentence_of;
+  std::vector<std::vector<size_t>> rows_of(num_sentences);
+  for (size_t s = 0; s < num_sentences; ++s) {
+    for (size_t b = 0; b < beam_widths[s]; ++b) {
+      rows_of[s].push_back(rep.size());
+      sentence_of.push_back(s);
+      rep.push_back(s);
+    }
+  }
+  size_t rows = rep.size();
+
+  Tensor enc = select_batch(encoder_out, rep, "encoder_out_beam");
+  Tensor msk = select_batch(mask, rep, "mask_beam");
+
+  // Per-row shortlist groups (rows of one sentence share its shortlist).
+  std::vector<std::shared_ptr<const Words>> group_words;
+  std::vector<SelectedAffine> group_selected;
+  std::vector<size_t> row_group(rows);
+  for (size_t r = 0; r < rows; ++r) {
+    std::shared_ptr<const Words> words =
+        row_shortlists.empty() ? nullptr : row_shortlists[rep[r]];
+    size_t group = 0;
+    while (group < group_words.size() && group_words[group] != words) {
+      group++;
+    }
+    if (group == group_words.size()) {
+      group_words.push_back(words);
+      group_selected.push_back(
+          words ? decoder.prepare_shortlisted_output(*words) : SelectedAffine{});
+    }
+    row_group[r] = group;
+  }
+
+  std::vector<Tensor> states = decoder.start_states(rows);
+  std::vector<AttentionContext> contexts = decoder.prepare_contexts(enc);
+
+  // Only beam 0 of each sentence is live at step 0, so the first expansion
+  // picks `beam_widths[s]` distinct continuations rather than the same token.
+  constexpr double kNegInf = -1e30;
+  std::vector<double> score(rows, kNegInf);
+  for (size_t s = 0; s < num_sentences; ++s) {
+    score[rows_of[s][0]] = 0.0;
+  }
+  std::vector<Words> seq(rows);
+  std::vector<bool> done(rows, false);
+
+  std::vector<size_t> caps(num_sentences);
+  for (size_t s = 0; s < num_sentences; ++s) {
+    caps[s] = limit_factor * lengths[s] + 8;
+  }
+  size_t max_len = limit_factor * source_sequence_length + 8;
+
+  // A scored continuation of a parent beam row.
+  struct Cand {
+    size_t parent;
+    uint32_t token;
+    double score;
+  };
+
+  Words previous;  // empty at step 0 -> zero embedding for every row
+  arena.reset();
+  for (size_t step = 0; step < max_len; ++step) {
+    bool all_done = true;
+    for (size_t r = 0; r < rows; ++r) {
+      all_done = all_done && done[r];
+    }
+    if (all_done) {
+      break;
+    }
+
+    std::vector<size_t> parent(rows);
+    std::vector<uint32_t> token(rows);
+    std::vector<double> next_score(rows);
+    std::vector<Words> next_seq(rows);
+    std::vector<bool> next_done(rows);
+
+    {
+      ArenaScope arena_scope(arena);
+      auto [hidden, attn] =
+          decoder.step(enc, msk, states, contexts, previous, step);
+      (void)attn;
+      size_t hidden_dim = hidden.dim(-1);
+      const float *hidden_data = hidden.data<float>();
+
+      // Per beam row, its top candidate tokens (global ids) with log-probs.
+      std::vector<std::vector<Cand>> row_cands(rows);
+      std::vector<std::vector<size_t>> members(group_words.size());
+      for (size_t r = 0; r < rows; ++r) {
+        members[row_group[r]].push_back(r);
+      }
+      for (size_t g = 0; g < members.size(); ++g) {
+        if (members[g].empty()) {
+          continue;
+        }
+        Tensor gathered;
+        const Tensor *x = &hidden;
+        if (members[g].size() != rows) {
+          gathered = Tensor(Type::f32, Shape({members[g].size(), 1, hidden_dim}),
+                            "grouped_hidden");
+          float *dst = gathered.data<float>();
+          for (size_t j = 0; j < members[g].size(); ++j) {
+            const float *src = hidden_data + members[g][j] * hidden_dim;
+            std::copy(src, src + hidden_dim, dst + j * hidden_dim);
+          }
+          x = &gathered;
+        }
+        Tensor logits = group_words[g]
+                            ? affine_with_selected(group_selected[g], *x, "logits")
+                            : decoder.project(*x);
+        size_t stride =
+            group_words[g] ? group_words[g]->size() : target_vocab.size();
+        const float *data = logits.data<float>();
+        for (size_t j = 0; j < members[g].size(); ++j) {
+          size_t r = members[g][j];
+          const float *rowl = data + j * stride;
+          float mx = rowl[0];
+          for (size_t k = 1; k < stride; ++k) mx = std::max(mx, rowl[k]);
+          double denom = 0.0;
+          for (size_t k = 0; k < stride; ++k) {
+            denom += std::exp(static_cast<double>(rowl[k] - mx));
+          }
+          double log_denom = std::log(denom);
+          size_t want = beam_widths[sentence_of[r]];
+          std::vector<size_t> order(stride);
+          std::iota(order.begin(), order.end(), 0);
+          size_t take = std::min(want, stride);
+          std::partial_sort(
+              order.begin(), order.begin() + take, order.end(),
+              [&](size_t a, size_t b) { return rowl[a] > rowl[b]; });
+          for (size_t t = 0; t < take; ++t) {
+            size_t local = order[t];
+            uint32_t gid =
+                group_words[g] ? (*group_words[g])[local] : static_cast<uint32_t>(local);
+            double lp = static_cast<double>(rowl[local] - mx) - log_denom;
+            row_cands[r].push_back({r, gid, score[r] + lp});
+          }
+        }
+      }
+
+      // Per sentence, pick the top-k continuations across its beams. A finished
+      // beam carries forward as a single frozen candidate so it keeps competing.
+      for (size_t s = 0; s < num_sentences; ++s) {
+        std::vector<Cand> cands;
+        for (size_t r : rows_of[s]) {
+          if (done[r]) {
+            cands.push_back({r, eos, score[r]});
+          } else {
+            for (const Cand &c : row_cands[r]) {
+              cands.push_back(c);
+            }
+          }
+        }
+        size_t k = rows_of[s].size();
+        std::partial_sort(
+            cands.begin(), cands.begin() + std::min(k, cands.size()), cands.end(),
+            [](const Cand &a, const Cand &b) { return a.score > b.score; });
+        for (size_t b = 0; b < k; ++b) {
+          size_t slot = rows_of[s][b];
+          const Cand &c = cands[std::min(b, cands.size() - 1)];
+          parent[slot] = c.parent;
+          token[slot] = c.token;
+          next_score[slot] = c.score;
+          bool parent_done = done[c.parent];
+          next_seq[slot] = seq[c.parent];
+          if (!parent_done) {
+            next_seq[slot].push_back(c.token);
+          }
+          next_done[slot] =
+              parent_done || c.token == eos || next_seq[slot].size() >= caps[s];
+        }
+      }
+    }
+
+    // Gather SSRU states to follow each new beam's parent. Contexts are shared
+    // across a sentence's beams (same source), so they need no reordering.
+    for (Tensor &state : states) {
+      state = select_batch(state, parent, state.name());
+    }
+    score = std::move(next_score);
+    seq = std::move(next_seq);
+    done = std::move(next_done);
+    previous = Words(token.begin(), token.end());
+  }
+
+  // Drop ruy packs of the decode-scoped shortlisted Ws before group_selected
+  // frees them, so a later allocation reusing an address can't hit a stale
+  // pack (same contract as the greedy decode).
+  qmm::clear_standalone_pack_cache();
+
+  Histories histories;
+  histories.reserve(num_sentences);
+  for (size_t s = 0; s < num_sentences; ++s) {
+    size_t best = rows_of[s][0];
+    double best_norm = kNegInf;
+    for (size_t r : rows_of[s]) {
+      double norm = seq[r].empty() ? kNegInf : score[r] / seq[r].size();
+      if (norm > best_norm) {
+        best_norm = norm;
+        best = r;
+      }
+    }
+    Hypothesis hypothesis{.target = std::move(seq[best]), .alignment = {}};
+    histories.push_back(std::make_shared<Hypothesis>(std::move(hypothesis)));
+  }
+  return histories;
+}
+
 Histories Model::forward(const Input &input) const {
   const Tensor &indices = input.indices();
   const Tensor &mask = input.mask();
@@ -640,14 +861,16 @@ Histories Model::forward(const Input &input) const {
     encoder_out = arena_encoder_out.clone("encoder_out");
   }
 
-  // SLIMT_ROBUST_D > 0 enables the two-pass robust decode: greedy first, then
-  // re-decode only the low-confidence sentences (max contiguous log-prob
-  // deficit above the threshold) with selective look-ahead, reusing the
-  // encoder output. 0 disables it (pure greedy, no deficit overhead).
+  // Two-pass robust decode: greedy first (capturing each sentence's max
+  // contiguous log-prob deficit), then re-decode only the low-confidence
+  // sentences with batched beam search, reusing the encoder output. The beam
+  // width is stratified by deficit. SLIMT_ROBUST_D overrides the re-decode
+  // threshold; 0 disables the pass (pure greedy, no deficit overhead).
   static const double robust_d = [] {
     const char *v = std::getenv("SLIMT_ROBUST_D");
-    return v != nullptr ? std::strtod(v, nullptr) : 0.0;
+    return v != nullptr ? std::strtod(v, nullptr) : 1.0;
   }();
+  constexpr double kBeam3Deficit = 1.5;
 
   std::vector<double> deficits;
   Histories histories =
@@ -656,22 +879,33 @@ Histories Model::forward(const Input &input) const {
              robust_d > 0.0 ? &deficits : nullptr);
 
   if (robust_d > 0.0) {
+    std::vector<size_t> flagged;
+    std::vector<size_t> widths;
     for (size_t i = 0; i < deficits.size(); ++i) {
       if (deficits[i] <= robust_d) {
         continue;
       }
-      std::vector<size_t> one{i};
-      Tensor enc1 = select_batch(encoder_out, one, "encoder_out_robust");
-      Tensor mask1 = select_batch(mask, one, "mask_robust");
-      RowShortlists shortlist1;
+      flagged.push_back(i);
+      widths.push_back(deficits[i] >= kBeam3Deficit ? 3 : 2);
+    }
+    if (!flagged.empty()) {
+      Tensor enc = select_batch(encoder_out, flagged, "encoder_out_flagged");
+      Tensor msk = select_batch(mask, flagged, "mask_flagged");
+      RowShortlists shortlist;
       if (!input.shortlist_rows().empty()) {
-        shortlist1.push_back(input.shortlist_rows()[i]);
+        for (size_t i : flagged) {
+          shortlist.push_back(input.shortlist_rows()[i]);
+        }
       }
-      std::vector<size_t> lengths1{input.lengths()[i]};
-      Histories one_history =
-          decode(enc1, mask1, shortlist1, lengths1, input.limit_factor(), arena,
-                 /*selective=*/true, nullptr);
-      histories[i] = std::move(one_history[0]);
+      std::vector<size_t> lengths;
+      for (size_t i : flagged) {
+        lengths.push_back(input.lengths()[i]);
+      }
+      Histories re_decoded = decode_beam(enc, msk, shortlist, lengths, widths,
+                                         input.limit_factor(), arena);
+      for (size_t j = 0; j < flagged.size(); ++j) {
+        histories[flagged[j]] = std::move(re_decoded[j]);
+      }
     }
   }
 
