@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <tuple>
@@ -412,6 +414,89 @@ void topk_inspect_with_words(size_t batch_id, const Vocabulary &vocabulary,
   fprintf(stderr, "\n");
 }
 
+// --- Decode-time confidence inspection (env-gated) --------------------------
+// With SLIMT_INSPECT=1 set, print one line per generated target token: the
+// chosen token and its softmax probability, how many shortlist candidates were
+// real contenders (p >= 1%), and the next-best alternatives with their
+// probabilities — i.e. the "swap this for X" candidates a UI could surface. A
+// *LOW* marker flags tokens the model was unsure about. SLIMT_INSPECT_TOPK
+// (default 5) and SLIMT_INSPECT_THRESHOLD (default 0.5) tune it. Intended for
+// single-sentence inputs: the step counter assumes one active row per call.
+struct InspectCfg {
+  bool on;
+  size_t topk;
+  double low;
+};
+
+const InspectCfg &inspect_cfg() {
+  static const InspectCfg cfg = [] {
+    const char *e = std::getenv("SLIMT_INSPECT");
+    const char *k = std::getenv("SLIMT_INSPECT_TOPK");
+    const char *t = std::getenv("SLIMT_INSPECT_THRESHOLD");
+    InspectCfg c;
+    c.on = (e != nullptr) && (e[0] != '\0') && (std::strcmp(e, "0") != 0);
+    c.topk = (k != nullptr) ? std::strtoul(k, nullptr, 10) : 5;
+    if (c.topk == 0) c.topk = 5;
+    c.low = (t != nullptr) ? std::strtod(t, nullptr) : 0.5;
+    return c;
+  }();
+  return cfg;
+}
+
+thread_local size_t g_inspect_step = 0;
+
+// `local_to_word(i)` maps a logit-row index to the global target word id: the
+// identity for the full-vocabulary path, a shortlist lookup for the
+// shortlisted path.
+template <class MapFn>
+void inspect_step(const float *row, size_t stride, MapFn local_to_word,
+                  const Vocabulary &vocabulary) {
+  const InspectCfg &cfg = inspect_cfg();
+  float maxv = row[0];
+  for (size_t i = 1; i < stride; ++i) maxv = std::max(maxv, row[i]);
+  double denom = 0.0;
+  for (size_t i = 0; i < stride; ++i) {
+    denom += std::exp(static_cast<double>(row[i] - maxv));
+  }
+  auto prob = [&](size_t i) {
+    return std::exp(static_cast<double>(row[i] - maxv)) / denom;
+  };
+
+  std::vector<size_t> ordering = argsort(row, row + stride);
+  size_t best = ordering[stride - 1];
+  Word eos = vocabulary.eos_id();
+
+  size_t contenders = 0;
+  for (size_t i = 0; i < stride; ++i) {
+    if (prob(i) >= 0.01) ++contenders;
+  }
+
+  auto decode_one = [&](size_t local) {
+    std::string s;
+    vocabulary.decode({static_cast<Word>(local_to_word(local)), eos}, s);
+    return s;
+  };
+
+  std::string chosen = "'" + decode_one(best) + "'";
+  double chosen_p = prob(best);
+  fprintf(stderr, "step %2zu  %-16s p=%.3f  %2zu contender(s)%s | alts:",
+          g_inspect_step, chosen.c_str(), chosen_p, contenders,
+          chosen_p < cfg.low ? "  *LOW*" : "");
+
+  size_t shown = std::min(cfg.topk, stride > 0 ? stride - 1 : 0);
+  for (size_t r = 1; r <= shown; ++r) {
+    size_t local = ordering[stride - 1 - r];
+    fprintf(stderr, " %s(%.3f)", decode_one(local).c_str(), prob(local));
+  }
+  fprintf(stderr, "\n");
+
+  if (static_cast<Word>(local_to_word(best)) == eos) {
+    g_inspect_step = 0;
+  } else {
+    ++g_inspect_step;
+  }
+}
+
 }  // namespace
 
 Words greedy_sample(const Tensor &logits, const Vocabulary &vocabulary,
@@ -423,10 +508,9 @@ Words greedy_sample(const Tensor &logits, const Vocabulary &vocabulary,
   for (size_t i = 0; i < batch_size; i++) {
     size_t max_index = argmax(data + i * stride, stride);
     sampled_words.push_back(max_index);
-    if (false) {  // NOLINT
-      constexpr size_t kValue = 5;
-      topk_inspect(i, vocabulary, data + i * stride, data + (i + 1) * stride,
-                   kValue);
+    if (inspect_cfg().on) {
+      inspect_step(
+          data + i * stride, stride, [](size_t x) { return x; }, vocabulary);
     }
   }
   return sampled_words;
@@ -435,7 +519,6 @@ Words greedy_sample(const Tensor &logits, const Vocabulary &vocabulary,
 Words greedy_sample_from_words(const Tensor &logits,
                                const Vocabulary &vocabulary, const Words &words,
                                size_t batch_size) {
-  (void)vocabulary;
   size_t stride = words.size();
   Words sampled_words;
   sampled_words.reserve(batch_size);
@@ -444,10 +527,9 @@ Words greedy_sample_from_words(const Tensor &logits,
     const float *row = data + i * stride;
     size_t max_index = argmax(row, stride);
     sampled_words.push_back(words[max_index]);
-    if (false) {  // NOLINT
-      constexpr size_t kValue = 5;
-      topk_inspect_with_words(i, vocabulary, words, row,
-                              data + (i + 1) * stride, kValue);
+    if (inspect_cfg().on) {
+      inspect_step(
+          row, stride, [&](size_t x) { return words[x]; }, vocabulary);
     }
   }
   return sampled_words;
