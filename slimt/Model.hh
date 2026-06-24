@@ -84,17 +84,15 @@ class SLIMT_EXPORT Model {
   }
 
  private:
-  // Greedy/selective decode over a batch. `mask`, `shortlist_rows`, `lengths`
-  // and `limit_factor` are the per-row inputs (passed explicitly, not as an
-  // Input, so a flagged subset can be re-decoded). With `selective`, low-
-  // confidence forks are resolved by short look-ahead roll-outs (single-row
-  // path). When `out_deficits` is non-null it receives each sentence's worst
-  // contiguous log-prob deficit — the two-pass router's flag signal.
+  // Greedy decode over a batch. `mask`, `shortlist_rows`, `lengths` and
+  // `limit_factor` are the per-row inputs (passed explicitly, not as an Input,
+  // so a flagged subset can be re-decoded). When `out_deficits` is non-null it
+  // receives each sentence's worst contiguous log-prob deficit — the two-pass
+  // router's flag signal.
   Histories decode(const Tensor &encoder_out, const Tensor &mask,
                    const RowShortlists &shortlist_rows,
                    const std::vector<size_t> &lengths, float limit_factor,
-                   Arena &arena, bool selective,
-                   std::vector<double> *out_deficits) const;
+                   Arena &arena, std::vector<double> *out_deficits) const;
 
   // Batched beam decode over `S` sentences with a per-sentence width
   // (`beam_widths[s]`). All Σ widths hypotheses step in one fused batched

@@ -172,7 +172,7 @@ void update_alignment(const std::vector<size_t> &active_to_original,
 Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
                         const RowShortlists &row_shortlists,
                         const std::vector<size_t> &lengths, float limit_factor,
-                        Arena &arena, bool selective,
+                        Arena &arena,
                         std::vector<double> *out_deficits) const {
   size_t batch_size = encoder_out.dim(-3);
   size_t source_sequence_length = encoder_out.dim(-2);
@@ -320,119 +320,6 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
     active_to_original = std::move(next_active_to_original);
   };
 
-  // --- Selective-branch ("shallow beam") re-decode --------------------------
-  // Engaged by `selective` (the two-pass router re-decoding a flagged
-  // sentence): at a low-confidence fork (top probability below SLIMT_SB_THRESH)
-  // expand the top-B candidate tokens, greedily roll each out for a short
-  // window, and commit the first token of whichever roll-out has the best mean
-  // log-probability. Confident tokens stay pure-greedy, so the extra compute is
-  // paid only at forks. Single-sentence (batch_size==1) only.
-  struct SbCfg {
-    size_t branches;
-    size_t window;
-    double thresh;
-    bool log;
-  };
-  static const SbCfg sb = [] {
-    auto n = [](const char *k, size_t d) {
-      const char *v = std::getenv(k);
-      return v ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : d;
-    };
-    auto f = [](const char *k, double d) {
-      const char *v = std::getenv(k);
-      return v ? std::strtod(v, nullptr) : d;
-    };
-    auto z = [](const char *k) {
-      const char *v = std::getenv(k);
-      return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
-    };
-    return SbCfg{std::max<size_t>(2, n("SLIMT_SB_B", 3)),
-                 std::max<size_t>(1, n("SLIMT_SB_W", 8)),
-                 f("SLIMT_SB_THRESH", 0.6), z("SLIMT_SB_LOG")};
-  }();
-
-  // Greedily roll one candidate first token forward `sb.window` steps and
-  // return its mean log-probability. The SSRU states are cloned so the real
-  // decode state is untouched; the cross-attention contexts are read-only and
-  // shared across rollouts.
-  auto sb_rollout = [&](size_t g, const float *cur_row, size_t stride,
-                        size_t first_idx, size_t step_index) -> double {
-    std::vector<Tensor> sclone;
-    sclone.reserve(states.size());
-    for (const Tensor &s : states) sclone.push_back(s.clone());
-    auto eos_id = target_vocab.eos_id();
-    auto to_word = [&](size_t idx) -> uint32_t {
-      return group_words[g] ? (*group_words[g])[idx] : static_cast<uint32_t>(idx);
-    };
-    float m0 = cur_row[0];
-    for (size_t k = 1; k < stride; ++k) m0 = std::max(m0, cur_row[k]);
-    double denom0 = 0.0;
-    for (size_t k = 0; k < stride; ++k) {
-      denom0 += std::exp(static_cast<double>(cur_row[k] - m0));
-    }
-    double total = static_cast<double>(cur_row[first_idx] - m0) - std::log(denom0);
-    size_t ntok = 1;
-    uint32_t prev_word = to_word(first_idx);
-    for (size_t w = 1; w <= sb.window && prev_word != eos_id; ++w) {
-      Words prev = {prev_word};
-      auto [h, attn] = decoder.step(*active_encoder_out, *active_mask, sclone,
-                                    contexts, prev, step_index + w);
-      (void)attn;
-      Tensor logits = group_words[g]
-                          ? affine_with_selected(group_selected[g], h, "logits")
-                          : decoder.project(h);
-      const float *row = logits.data<float>();
-      size_t best = 0;
-      float mx = row[0];
-      for (size_t k = 1; k < stride; ++k) {
-        if (row[k] > mx) {
-          mx = row[k];
-          best = k;
-        }
-      }
-      double denom = 0.0;
-      for (size_t k = 0; k < stride; ++k) {
-        denom += std::exp(static_cast<double>(row[k] - mx));
-      }
-      total += -std::log(denom);
-      ++ntok;
-      prev_word = to_word(best);
-    }
-    return total / static_cast<double>(ntok);
-  };
-
-  // Among the top-B candidates pick the one with the best rolled-out mean
-  // log-prob.
-  auto sb_pick = [&](size_t g, const float *row, size_t stride,
-                     size_t step_index) -> size_t {
-    std::vector<size_t> order(stride);
-    std::iota(order.begin(), order.end(), 0);
-    size_t branches = std::min(sb.branches, stride);
-    std::partial_sort(order.begin(), order.begin() + branches, order.end(),
-                      [&](size_t a, size_t b) { return row[a] > row[b]; });
-    size_t best_idx = order[0];
-    double best_score = -1e300;
-    for (size_t r = 0; r < branches; ++r) {
-      double sc = sb_rollout(g, row, stride, order[r], step_index);
-      if (sb.log) {
-        std::string tok;
-        auto wid = group_words[g] ? (*group_words[g])[order[r]] : order[r];
-        target_vocab.decode({static_cast<Word>(wid), target_vocab.eos_id()}, tok);
-        fprintf(stderr, "[sb]   cand '%s' meanlogp=%.4f\n", tok.c_str(), sc);
-      }
-      if (sc > best_score) {
-        best_score = sc;
-        best_idx = order[r];
-      }
-    }
-    return best_idx;
-  };
-
-  // Project the step's hidden states group by group and sample. Each
-  // group's rows are gathered into a contiguous slab (skipped when one
-  // group covers every active row, the common single-request case); the
-  // gathered slab and logits are step transients, so this must run inside
-  // the step's ArenaScope.
   // Deficit-router state (only maintained when out_deficits is requested, i.e.
   // the greedy pass). Tokens above kDeficitBaseline credit the running sum,
   // below it accrue deficit; def_best holds each sentence's worst contiguous
@@ -441,7 +328,7 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
   std::vector<double> def_cur(out_deficits ? batch_size : 0, 0.0);
   std::vector<double> def_best(out_deficits ? batch_size : 0, 0.0);
 
-  auto sample_step = [&](const Tensor &hidden, size_t step_index) {
+  auto sample_step = [&](const Tensor &hidden) {
     size_t active_rows = active_to_original.size();
     size_t hidden_dim = hidden.dim(-1);
     Words sampled(active_rows);
@@ -469,34 +356,6 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
         x = &gathered;
       }
 
-      if (selective && batch_size == 1 && active_rows == 1) {
-        Tensor logits = group_words[g]
-                            ? affine_with_selected(group_selected[g], *x, "logits")
-                            : decoder.project(*x);
-        size_t stride =
-            group_words[g] ? group_words[g]->size() : target_vocab.size();
-        const float *row = logits.data<float>();
-        size_t amax = 0;
-        float mx = row[0];
-        for (size_t k = 1; k < stride; ++k) {
-          if (row[k] > mx) {
-            mx = row[k];
-            amax = k;
-          }
-        }
-        double denom = 0.0;
-        for (size_t k = 0; k < stride; ++k) {
-          denom += std::exp(static_cast<double>(row[k] - mx));
-        }
-        double p0 = 1.0 / denom;
-        size_t chosen = (p0 >= sb.thresh) ? amax : sb_pick(g, row, stride, step_index);
-        if (sb.log && p0 < sb.thresh) {
-          fprintf(stderr, "[sb] step %zu FORK p0=%.3f\n", step_index, p0);
-        }
-        sampled[members[g][0]] = group_words[g] ? (*group_words[g])[chosen]
-                                                : static_cast<uint32_t>(chosen);
-        continue;
-      }
       Tensor logits = group_words[g]
                           ? affine_with_selected(group_selected[g], *x, "logits")
                           : decoder.project(*x);
@@ -540,7 +399,7 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
     auto [hidden, attn] = decoder.step(*active_encoder_out, *active_mask,
                                        states, contexts, previous_slice,
                                        /*step_index=*/0);
-    previous_slice = sample_step(hidden, 0);
+    previous_slice = sample_step(hidden);
     update_alignment(active_to_original, lengths, complete, attn,
                      alignments);
     remaining = record(active_to_original, previous_slice, sentences);
@@ -557,7 +416,7 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
                                          states, contexts, previous_slice,
                                          /*step_index=*/i);
       steps++;
-      previous_slice = sample_step(hidden, i);
+      previous_slice = sample_step(hidden);
       update_alignment(active_to_original, lengths, complete, attn,
                        alignments);
       remaining = record(active_to_original, previous_slice, sentences);
@@ -875,7 +734,7 @@ Histories Model::forward(const Input &input) const {
   std::vector<double> deficits;
   Histories histories =
       decode(encoder_out, mask, input.shortlist_rows(), input.lengths(),
-             input.limit_factor(), arena, /*selective=*/false,
+             input.limit_factor(), arena,
              robust_d > 0.0 ? &deficits : nullptr);
 
   if (robust_d > 0.0) {
