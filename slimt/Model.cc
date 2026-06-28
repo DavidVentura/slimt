@@ -159,10 +159,20 @@ void update_alignment(const std::vector<size_t> &active_to_original,
     if (!finished[original_id]) {
       size_t batch_stride = (num_heads * slice * source_length);
       size_t head_stride = (slice * source_length);
-      const float *alignment = data + id * batch_stride + head_stride * 0;
       size_t length = lengths[original_id];
-      Distribution distribution(length);
-      std::copy(alignment, alignment + length, distribution.data());
+      // Average the alignment over all heads rather than reading head 0. The
+      // int8 cross-attention develops an outlier "sink" key on the sentence-end
+      // tokens that, on the head used for alignment, collapses the distribution
+      // onto the final period in the sentence tail; averaging the heads dilutes
+      // that single bad head and recovers the alignment.
+      Distribution distribution(length, 0.0F);
+      for (size_t h = 0; h < num_heads; ++h) {
+        const float *a = data + id * batch_stride + head_stride * h;
+        for (size_t k = 0; k < length; ++k) distribution[k] += a[k];
+      }
+      for (size_t k = 0; k < length; ++k) {
+        distribution[k] /= static_cast<float>(num_heads);
+      }
       alignments[original_id].push_back(std::move(distribution));
     }
   }
