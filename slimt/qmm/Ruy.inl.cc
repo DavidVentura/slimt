@@ -159,8 +159,11 @@ void quantize(const float* input, float scale, Index rows, Index width,
               int8_t* output) {
   const Index size = rows * width;
   for (size_t i = 0; i < size; i++) {
-    // Round to nearest after multiplying with scale.
-    float value = roundf(scale * input[i]);
+    // Round half-to-even (nearbyintf, default FE_TONEAREST) to match intgemm's
+    // `_mm*_cvtps_epi32`, which marian uses. roundf rounds half-away-from-zero;
+    // the ±1 int8 disagreements on tie values shift the alignment argmax at
+    // tail cross-attention knife-edges (the off-by-one cascade).
+    float value = nearbyintf(scale * input[i]);
 
     // Since float can store bigger values, we threshold anything that's gone
     // higher and can't fit in int8.
