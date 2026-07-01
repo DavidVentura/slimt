@@ -525,6 +525,7 @@ Histories Model::decode_beam(const Tensor &encoder_out, const Tensor &mask,
     score[rows_of[s][0]] = 0.0;
   }
   std::vector<Words> seq(rows);
+  std::vector<Alignment> align(rows);
   std::vector<bool> done(rows, false);
 
   std::vector<size_t> caps(num_sentences);
@@ -555,13 +556,31 @@ Histories Model::decode_beam(const Tensor &encoder_out, const Tensor &mask,
     std::vector<uint32_t> token(rows);
     std::vector<double> next_score(rows);
     std::vector<Words> next_seq(rows);
+    std::vector<Alignment> next_align(rows);
     std::vector<bool> next_done(rows);
 
     {
       ArenaScope arena_scope(arena);
       auto [hidden, attn] =
           decoder.step(enc, msk, states, contexts, previous, step);
-      (void)attn;
+      // Per beam row, the source attention distribution (head 0) for this
+      // step's token, carried alongside the token through beam reordering so
+      // the winning hypothesis gets greedy-equivalent alignments. The pivot
+      // remap assumes one alignment row per target token; an empty matrix here
+      // makes combine() read out of bounds.
+      std::vector<Distribution> row_dist(rows);
+      {
+        const float *attn_data = attn.data<float>();
+        size_t num_heads = attn.dim(-3);
+        size_t slice = attn.dim(-2);
+        size_t attn_source_length = attn.dim(-1);
+        size_t row_stride = num_heads * slice * attn_source_length;
+        for (size_t r = 0; r < rows; ++r) {
+          size_t length = lengths[sentence_of[r]];
+          const float *src = attn_data + r * row_stride;
+          row_dist[r].assign(src, src + length);
+        }
+      }
       size_t hidden_dim = hidden.dim(-1);
       const float *hidden_data = hidden.data<float>();
 
@@ -645,8 +664,10 @@ Histories Model::decode_beam(const Tensor &encoder_out, const Tensor &mask,
           next_score[slot] = c.score;
           bool parent_done = done[c.parent];
           next_seq[slot] = seq[c.parent];
+          next_align[slot] = align[c.parent];
           if (!parent_done) {
             next_seq[slot].push_back(c.token);
+            next_align[slot].push_back(row_dist[c.parent]);
           }
           next_done[slot] =
               parent_done || c.token == eos || next_seq[slot].size() >= caps[s];
@@ -661,6 +682,7 @@ Histories Model::decode_beam(const Tensor &encoder_out, const Tensor &mask,
     }
     score = std::move(next_score);
     seq = std::move(next_seq);
+    align = std::move(next_align);
     done = std::move(next_done);
     previous = Words(token.begin(), token.end());
   }
@@ -682,7 +704,8 @@ Histories Model::decode_beam(const Tensor &encoder_out, const Tensor &mask,
         best = r;
       }
     }
-    Hypothesis hypothesis{.target = std::move(seq[best]), .alignment = {}};
+    Hypothesis hypothesis{.target = std::move(seq[best]),
+                          .alignment = std::move(align[best])};
     histories.push_back(std::make_shared<Hypothesis>(std::move(hypothesis)));
   }
   return histories;
