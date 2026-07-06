@@ -17,14 +17,22 @@
 
 namespace slimt {
 
-size_t cache_key(size_t model_id, const Words &words, bool with_alignment) {
+size_t cache_key(size_t model_id, const Words &words, bool with_alignment,
+                 bool with_alternatives, const Words &forced_prefix) {
   // Plain-text and alignment-bearing translations of the same sentence must
   // not share a cache entry: a History stored without alignment data could
   // otherwise be returned to a caller that asked for alignments. Fold the
-  // bool into the key so both variants are independently cacheable.
+  // bool into the key so both variants are independently cacheable. The same
+  // reasoning applies to alternatives, and additionally the greedy-only decode
+  // it forces can yield a different target than the robust path would.
   auto seed = model_id;
   hash_combine<size_t>(seed, with_alignment ? 1U : 0U);
+  hash_combine<size_t>(seed, with_alternatives ? 1U : 0U);
   for (size_t word : words) {
+    hash_combine<size_t>(seed, word);
+  }
+  hash_combine<size_t>(seed, forced_prefix.size());
+  for (size_t word : forced_prefix) {
     hash_combine<size_t>(seed, word);
   }
   return seed;
@@ -36,7 +44,9 @@ Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
                  std::shared_ptr<const Words> shortlist_words,
                  std::optional<TranslationCache> &cache,
                  Continuation &&continuation, OnError &&on_error,
-                 bool with_alignment)
+                 bool with_alignment,
+                 std::optional<AlternativesConfig> alternatives,
+                 Words forced_prefix)
     : id_(id),
       model_id_(model_id),
       source_(std::move(source)),
@@ -46,7 +56,9 @@ Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
       cache_(cache),
       continuation_(std::move(continuation)),
       on_error_(std::move(on_error)),
-      with_alignment_(with_alignment) {
+      with_alignment_(with_alignment),
+      alternatives_(std::move(alternatives)),
+      forced_prefix_(std::move(forced_prefix)) {
   counter_ = segments_.size();
   histories_.resize(segments_.size(), nullptr);
 
@@ -72,7 +84,8 @@ Request::Request(size_t id, size_t model_id, AnnotatedText &&source,
       // (counter_) to reflect one less segment to translate.
       for (size_t idx = 0; idx < segments_.size(); idx++) {
         words_total_ += segments_[idx].size();
-        size_t key = cache_key(model_id_, segment(idx), with_alignment_);
+        size_t key = cache_key(model_id_, segment(idx), with_alignment_,
+                               alternatives_.has_value(), forced_prefix_);
         auto [found, history] = cache_->find(key);
         if (found) {
           histories_[idx] = history;
@@ -144,7 +157,8 @@ void Request::process(size_t index, History history) {
   // store the result.
   histories_[index] = std::move(history);
   if (cache_) {
-    size_t key = cache_key(model_id_, segment(index), with_alignment_);
+    size_t key = cache_key(model_id_, segment(index), with_alignment_,
+                           alternatives_.has_value(), forced_prefix_);
     cache_->store(key, histories_[index]);
   }
 
@@ -192,6 +206,9 @@ void Request::complete(Histories &&histories) {
     // hitting the same cache entry would see `has_alignments == false` and
     // miss the data the alignment-bearing caller actually asked for.
     response.alignments.push_back(histories[sentence_id]->alignment);
+    if (alternatives_.has_value()) {
+      response.alternatives.push_back(histories[sentence_id]->alternatives);
+    }
   }
 
   next_ = continuation_(std::move(response));

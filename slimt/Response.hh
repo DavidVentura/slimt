@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,12 @@ struct Response {
   /// with an alignment matrix for each sentence.
   std::vector<std::vector<std::vector<float>>> alignments;
 
+  /// Per-sentence, per-target-token top-k decode candidates (global word id +
+  /// softmax probability), with the chosen token first. Empty unless
+  /// `Options::alternatives` was set. Raw and unfiltered — callers decode the
+  /// word ids and decide which to surface.
+  std::vector<TokenAlternatives> alternatives;
+
   /// Convenience function to obtain number of units translated. Same as
   /// `.source.sentence_count()` and `.target.sentence_count().` The processing
   /// of a text of into sentences are handled internally, and this information
@@ -45,6 +52,15 @@ struct Response {
 /// text to be translated.
 struct Options {
   bool alignment{false};  ///< Include alignments or not.
+
+  /// When set, decode greedily (skipping the robust beam re-decode) and harvest
+  /// per-token alternatives into `Response::alternatives`.
+  std::optional<AlternativesConfig> alternatives{};
+
+  /// Target tokens to force for the first N decode steps (teacher-forcing),
+  /// after which the model free-runs. Used to re-translate with a user-edited
+  /// prefix. Empty means no forcing. Implies greedy decode.
+  Words forced_prefix{};
 
   /// Fired once per Request when it finishes translating, from the worker
   /// thread. Used to report incremental progress without slicing the corpus

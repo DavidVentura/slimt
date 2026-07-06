@@ -61,9 +61,31 @@ using Distribution = std::vector<float>;
 using Alignment = std::vector<Distribution>;
 using Alignments = std::vector<Alignment>;
 
+// One candidate from a decode step's distribution: the token sequence forming a
+// complete target word (the first subword plus its greedy continuation to the
+// next word boundary) and the softmax probability of its first subword. The
+// chosen (argmax) token is the first entry of a step's candidate list, so its
+// probability doubles as that token's confidence.
+struct TokenAlternative {
+  Words word;
+  float prob;
+};
+using StepAlternatives = std::vector<TokenAlternative>;
+// Per generated target token, the top-k candidates for that step. Parallel to
+// `Hypothesis::target`. Empty unless alternatives were requested.
+using TokenAlternatives = std::vector<StepAlternatives>;
+
+// Knobs for harvesting per-token alternatives during greedy decode. `top_k`
+// candidates are kept per step, dropping any below `min_prob`.
+struct AlternativesConfig {
+  size_t top_k;
+  float min_prob;
+};
+
 struct Hypothesis {
   Segment target;
   Alignment alignment;
+  TokenAlternatives alternatives;
 };
 
 using History = Ptr<Hypothesis>;

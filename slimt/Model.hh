@@ -92,7 +92,9 @@ class SLIMT_EXPORT Model {
   Histories decode(const Tensor &encoder_out, const Tensor &mask,
                    const RowShortlists &shortlist_rows,
                    const std::vector<size_t> &lengths, float limit_factor,
-                   Arena &arena, std::vector<double> *out_deficits) const;
+                   Arena &arena, std::vector<double> *out_deficits,
+                   const std::optional<AlternativesConfig> &alt_cfg,
+                   const std::vector<Words> &forced_prefix) const;
 
   // Batched beam decode over `S` sentences with a per-sentence width
   // (`beam_widths[s]`). All Σ widths hypotheses step in one fused batched

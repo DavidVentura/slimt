@@ -36,6 +36,37 @@ Input convert(const Batch &batch, uint32_t pad_id, float limit_factor) {
   }
 
   input.set_shortlist(batch.shortlist());
+
+  // Carry each row's request-level alternatives choice onto the Input. All
+  // requesting rows share the same config (set once by the caller), so the
+  // first one seen fixes it; the per-row flags let forward() keep those rows
+  // greedy while still beam-re-decoding the rest of the batch.
+  std::optional<AlternativesConfig> alt_cfg;
+  std::vector<bool> alt_rows(segment_refs.size(), false);
+  for (size_t i = 0; i < segment_refs.size(); ++i) {
+    const std::optional<AlternativesConfig> &req = segment_refs[i].request()->alternatives();
+    if (req.has_value()) {
+      alt_rows[i] = true;
+      if (!alt_cfg.has_value()) {
+        alt_cfg = req;
+      }
+    }
+  }
+  if (alt_cfg.has_value()) {
+    input.set_alternatives(*alt_cfg, std::move(alt_rows));
+  }
+
+  // Carry each row's forced target prefix (for steered re-translation).
+  std::vector<Words> forced(segment_refs.size());
+  bool any_forced = false;
+  for (size_t i = 0; i < segment_refs.size(); ++i) {
+    forced[i] = segment_refs[i].request()->forced_prefix();
+    any_forced = any_forced || !forced[i].empty();
+  }
+  if (any_forced) {
+    input.set_forced(std::move(forced));
+  }
+
   input.finalize();
   return input;
 }
@@ -75,7 +106,10 @@ Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
                           std::optional<TranslationCache> &cache,
                           AnnotatedText &&annotated_text, Segments &&segments,
                           Continuation &&continuation, OnError &&on_error,
-                          bool with_alignment) {
+                          bool with_alignment,
+                          std::optional<AlternativesConfig> alternatives =
+                              std::nullopt,
+                          Words forced_prefix = {}) {
   std::shared_ptr<const Words> shortlist_words;
   if (model->shortlist_generator()) {
     Words context_words;
@@ -100,7 +134,9 @@ Ptr<Request> make_request(size_t id, const Ptr<Model> &model,
       cache,                                     //
       std::forward<Continuation>(continuation),  //
       std::forward<OnError>(on_error),           //
-      with_alignment                             //
+      with_alignment,                            //
+      std::move(alternatives),                   //
+      std::move(forced_prefix)                   //
   );
   return request;
 }
@@ -148,7 +184,8 @@ std::vector<Response> Blocking::translate(const Ptr<Model> &model,
         processor.process(std::move(source), config_.wrap_length);
     auto request = make_request(id(), model, cache_, std::move(annotated),
                                 std::move(segments), continuation, on_error,
-                                /*with_alignment=*/options.alignment);
+                                /*with_alignment=*/options.alignment,
+                                options.alternatives, options.forced_prefix);
 
     batcher.enqueue(request);
   }
@@ -295,7 +332,8 @@ Handle Async::translate(const Ptr<Model> &model, std::string source,
       processor.process(std::move(source), config_.wrap_length);
   auto request = make_request(id(), model, cache_, std::move(annotated),
                               std::move(segments), continuation, on_error,
-                              /*with_alignment=*/options.alignment);
+                              /*with_alignment=*/options.alignment,
+                              options.alternatives, options.forced_prefix);
 
   batcher_.enqueue(model, request);
 

@@ -172,8 +172,9 @@ void update_alignment(const std::vector<size_t> &active_to_original,
 Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
                         const RowShortlists &row_shortlists,
                         const std::vector<size_t> &lengths, float limit_factor,
-                        Arena &arena,
-                        std::vector<double> *out_deficits) const {
+                        Arena &arena, std::vector<double> *out_deficits,
+                        const std::optional<AlternativesConfig> &alt_cfg,
+                        const std::vector<Words> &forced_prefix) const {
   size_t batch_size = encoder_out.dim(-3);
   size_t source_sequence_length = encoder_out.dim(-2);
 
@@ -222,7 +223,14 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
     target_caps[i] =
         limit_factor * lengths[i] + kTargetLengthSlack;
   }
-  auto record = [eos, &complete, &target_caps](
+  // Per-token alternatives, accumulated in lock-step with `sentences` under the
+  // same completeness guard so `alt_acc[s]` stays parallel to the sentence's
+  // target tokens. `step_alternatives` holds the current step's per-active-row
+  // candidates, filled by `sample_step` just before each `record`.
+  std::vector<StepAlternatives> step_alternatives;
+  std::vector<TokenAlternatives> alt_acc(alt_cfg ? batch_size : 0);
+
+  auto record = [eos, &complete, &target_caps, &step_alternatives, &alt_acc](
                     const std::vector<size_t> &active_to_original, Words &step,
                     Sentences &sentences) {
     size_t finished = 0;
@@ -230,6 +238,9 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
       size_t original_id = active_to_original[i];
       if (not complete[original_id]) {
         sentences[original_id].push_back(step[i]);
+        if (not alt_acc.empty()) {
+          alt_acc[original_id].push_back(std::move(step_alternatives[i]));
+        }
         complete[original_id] =
             (step[i] == eos) ||
             sentences[original_id].size() >= target_caps[original_id];
@@ -328,10 +339,63 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
   std::vector<double> def_cur(out_deficits ? batch_size : 0, 0.0);
   std::vector<double> def_best(out_deficits ? batch_size : 0, 0.0);
 
-  auto sample_step = [&](const Tensor &hidden) {
+  // Expand an alternative first-subword into a complete word: fork the active
+  // row's decoder state and greedily decode continuation subwords until the
+  // next word boundary (a word-start piece or eos). Runs only on the
+  // alternatives path, for a handful of candidates per gated position.
+  constexpr size_t kMaxExpand = 8;
+  auto expand_word = [&](size_t active_row, Word first, size_t next_step,
+                         size_t group) -> Words {
+    Words word{first};
+    if (target_vocab.is_word_start(first) == false) {
+      return word;
+    }
+    std::vector<size_t> pick{active_row};
+    std::vector<Tensor> spec_states;
+    spec_states.reserve(states.size());
+    for (const Tensor &st : states) {
+      spec_states.push_back(select_batch(st, pick, st.name()));
+    }
+    std::vector<AttentionContext> spec_contexts;
+    spec_contexts.reserve(contexts.size());
+    for (const AttentionContext &ctx : contexts) {
+      spec_contexts.push_back(
+          AttentionContext{select_batch(ctx.keys, pick, ctx.keys.name()),
+                           select_batch(ctx.values, pick, ctx.values.name())});
+    }
+    Tensor spec_enc = select_batch(*active_encoder_out, pick, "spec_enc");
+    Tensor spec_mask = select_batch(*active_mask, pick, "spec_mask");
+
+    Words prev{first};
+    for (size_t e = 0; e < kMaxExpand; ++e) {
+      auto [spec_hidden, spec_attn] = decoder.step(
+          spec_enc, spec_mask, spec_states, spec_contexts, prev, next_step + e);
+      Tensor logits =
+          group_words[group]
+              ? affine_with_selected(group_selected[group], spec_hidden,
+                                     "spec_logits")
+              : decoder.project(spec_hidden);
+      size_t stride =
+          group_words[group] ? group_words[group]->size() : target_vocab.size();
+      size_t local = argmax(logits.data<float>(), stride);
+      Word next = group_words[group] ? (*group_words[group])[local]
+                                     : static_cast<Word>(local);
+      if (next == eos || target_vocab.ends_word(next)) {
+        break;
+      }
+      word.push_back(next);
+      prev = Words{next};
+    }
+    return word;
+  };
+
+  auto sample_step = [&](const Tensor &hidden, size_t step_index) {
     size_t active_rows = active_to_original.size();
     size_t hidden_dim = hidden.dim(-1);
     Words sampled(active_rows);
+    if (alt_cfg) {
+      step_alternatives.assign(active_rows, {});
+    }
 
     std::vector<std::vector<size_t>> members(group_words.size());
     for (size_t i = 0; i < active_rows; ++i) {
@@ -386,8 +450,101 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
         }
       }
 
+      // Harvest each row's alternatives, with the word currently at this
+      // position first as the confidence anchor: the forced token on a
+      // user-confirmed prefix (so every steered word stays swappable and
+      // revertible), else the greedy argmax. The offered alternatives are the
+      // other top-k words — for a forced word that naturally includes the
+      // original the model preferred. Only word-boundary positions carry
+      // alternatives; each alternative first-subword is expanded to a whole word.
+      if (alt_cfg) {
+        const float *L = logits.data<float>();
+        size_t kk = std::min(alt_cfg->top_k + 1, stride);
+        for (size_t j = 0; j < members[g].size(); ++j) {
+          size_t orig = active_to_original[members[g][j]];
+          bool forced = orig < forced_prefix.size() &&
+                        step_index < forced_prefix[orig].size();
+          Word chosen = forced ? forced_prefix[orig][step_index] : group_sample[j];
+          if (!target_vocab.is_word_start(chosen)) {
+            continue;
+          }
+          const float *r = L + j * stride;
+          float mx = r[0];
+          for (size_t k = 1; k < stride; ++k) mx = std::max(mx, r[k]);
+          double denom = 0.0;
+          for (size_t k = 0; k < stride; ++k) {
+            denom += std::exp(static_cast<double>(r[k] - mx));
+          }
+          std::vector<size_t> top;
+          top.reserve(kk + 1);
+          for (size_t k = 0; k < stride; ++k) {
+            if (top.size() < kk || r[k] > r[top.back()]) {
+              auto pos = std::lower_bound(
+                  top.begin(), top.end(), k,
+                  [&](size_t a, size_t b) { return r[a] > r[b]; });
+              top.insert(pos, k);
+              if (top.size() > kk) top.pop_back();
+            }
+          }
+          auto prob_of = [&](size_t local) {
+            return static_cast<float>(
+                std::exp(static_cast<double>(r[local] - mx)) / denom);
+          };
+          // Probability of the word currently at this position. For a forced
+          // token that isn't the argmax, look up its column in the row.
+          float chosen_prob;
+          if (!forced) {
+            chosen_prob = prob_of(top[0]);
+          } else {
+            size_t chosen_local = stride;
+            if (group_words[g]) {
+              for (size_t k = 0; k < stride; ++k) {
+                if ((*group_words[g])[k] == chosen) {
+                  chosen_local = k;
+                  break;
+                }
+              }
+            } else if (chosen < stride) {
+              chosen_local = chosen;
+            }
+            if (chosen_local == stride) {
+              continue;  // forced token outside this row's vocab slice
+            }
+            chosen_prob = prob_of(chosen_local);
+          }
+          StepAlternatives candidates;
+          candidates.push_back(TokenAlternative{Words{chosen}, chosen_prob});
+          for (size_t rank = 0; rank < top.size(); ++rank) {
+            Word w = group_words[g] ? (*group_words[g])[top[rank]]
+                                    : static_cast<Word>(top[rank]);
+            if (w == chosen) {
+              continue;  // never offer the current word as its own alternative
+            }
+            float p = prob_of(top[rank]);
+            if (p < alt_cfg->min_prob) {
+              break;
+            }
+            if (!target_vocab.is_word_start(w)) {
+              continue;
+            }
+            candidates.push_back(TokenAlternative{
+                expand_word(members[g][j], w, step_index + 1, g), p});
+            if (candidates.size() > alt_cfg->top_k) {
+              break;
+            }
+          }
+          step_alternatives[members[g][j]] = std::move(candidates);
+        }
+      }
+
+      // Force the user-confirmed prefix token for early positions; free-run
+      // (argmax) thereafter.
       for (size_t j = 0; j < members[g].size(); ++j) {
-        sampled[members[g][j]] = group_sample[j];
+        size_t orig = active_to_original[members[g][j]];
+        bool forced = orig < forced_prefix.size() &&
+                      step_index < forced_prefix[orig].size();
+        sampled[members[g][j]] =
+            forced ? forced_prefix[orig][step_index] : group_sample[j];
       }
     }
     return sampled;
@@ -399,7 +556,7 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
     auto [hidden, attn] = decoder.step(*active_encoder_out, *active_mask,
                                        states, contexts, previous_slice,
                                        /*step_index=*/0);
-    previous_slice = sample_step(hidden);
+    previous_slice = sample_step(hidden, /*step_index=*/0);
     update_alignment(active_to_original, lengths, complete, attn,
                      alignments);
     remaining = record(active_to_original, previous_slice, sentences);
@@ -416,7 +573,7 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
                                          states, contexts, previous_slice,
                                          /*step_index=*/i);
       steps++;
-      previous_slice = sample_step(hidden);
+      previous_slice = sample_step(hidden, /*step_index=*/i);
       update_alignment(active_to_original, lengths, complete, attn,
                        alignments);
       remaining = record(active_to_original, previous_slice, sentences);
@@ -457,8 +614,10 @@ Histories Model::decode(const Tensor &encoder_out, const Tensor &mask,
   Histories histories;
   for (size_t i = 0; i < sentences.size(); i++) {
     Hypothesis hypothesis{
-        .target = std::move(sentences[i]),     //
-        .alignment = std::move(alignments[i])  //
+        .target = std::move(sentences[i]),      //
+        .alignment = std::move(alignments[i]),  //
+        .alternatives = alt_acc.empty() ? TokenAlternatives{}
+                                        : std::move(alt_acc[i])  //
     };
     auto history = std::make_shared<Hypothesis>(std::move(hypothesis));
     histories.push_back(std::move(history));
@@ -754,17 +913,34 @@ Histories Model::forward(const Input &input) const {
   }();
   constexpr double kBeam3Deficit = 1.5;
 
+  // Harvesting per-token alternatives needs the greedy distributions, which the
+  // robust beam re-decode would discard. A batch can mix rows that requested
+  // alternatives with rows that didn't (the Async batcher packs across
+  // requests), so deficits are still computed and the beam still runs — just
+  // not for the rows that asked for alternatives, whose greedy hypotheses are
+  // kept intact.
+  const std::optional<AlternativesConfig> &alt_cfg = input.alternatives();
+  bool robust = robust_d > 0.0;
+
   std::vector<double> deficits;
   Histories histories =
       decode(encoder_out, mask, input.shortlist_rows(), input.lengths(),
-             input.limit_factor(), arena,
-             robust_d > 0.0 ? &deficits : nullptr);
+             input.limit_factor(), arena, robust ? &deficits : nullptr, alt_cfg,
+             input.forced());
 
-  if (robust_d > 0.0) {
+  if (robust) {
+    const std::vector<bool> &alt_rows = input.alternatives_rows();
+    const std::vector<Words> &forced = input.forced();
     std::vector<size_t> flagged;
     std::vector<size_t> widths;
     for (size_t i = 0; i < deficits.size(); ++i) {
       if (deficits[i] <= robust_d) {
+        continue;
+      }
+      if (i < forced.size() && !forced[i].empty()) {
+        continue;  // forced-prefix rows must stay on the greedy path
+      }
+      if (!alt_rows.empty() && alt_rows[i]) {
         continue;
       }
       flagged.push_back(i);

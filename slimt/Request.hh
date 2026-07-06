@@ -48,7 +48,16 @@ class Request {
           Segments &&segments, const Vocabulary &vocabulary,
           std::shared_ptr<const Words> shortlist_words,
           std::optional<TranslationCache> &cache, Continuation &&continuation,
-          OnError &&on_error, bool with_alignment);
+          OnError &&on_error, bool with_alignment,
+          std::optional<AlternativesConfig> alternatives, Words forced_prefix);
+
+  /// Whether this request wants per-token alternatives, and with what config.
+  const std::optional<AlternativesConfig> &alternatives() const {
+    return alternatives_;
+  }
+
+  /// Target tokens forced for the first N decode steps (empty for none).
+  const Words &forced_prefix() const { return forced_prefix_; }
 
   /// Obtain the count of tokens in the segment correponding to index. Used to
   /// insert segment from multiple requests into the corresponding size
@@ -132,6 +141,15 @@ class Request {
   // cache key so plain-text and alignment-bearing requests for the same
   // sentence keep separate cache entries.
   bool with_alignment_ = false;
+
+  // Set when the caller wants per-token alternatives (and greedy-only decode).
+  // Folded into the cache key so an alternatives-bearing translation and a
+  // plain one of the same sentence keep separate cache entries.
+  std::optional<AlternativesConfig> alternatives_;
+
+  // Target tokens to force before free-running. Folded into the cache key so a
+  // steered re-translation never collides with the plain one.
+  Words forced_prefix_;
 };
 
 }  // namespace slimt
