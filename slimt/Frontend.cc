@@ -315,12 +315,14 @@ Handle Async::translate(const Ptr<Model> &model, std::string source,
                         const Options &options) {
   auto promise = std::make_shared<Promise>();
   auto future = promise->get_future();
+  // The caller's callback lives for the duration of the translate call and no
+  // longer, so one still running when the waiter wakes touches a dead frame.
   auto continuation = [promise, on_progress = options.on_progress](
                           Response &&response) {
-    promise->set_value(std::move(response));
     if (on_progress) {
       on_progress();
     }
+    promise->set_value(std::move(response));
     return nullptr;
   };
   auto on_error = [promise](std::exception_ptr eptr) {
@@ -366,12 +368,12 @@ Handle Async::pivot(const Ptr<Model> &first, const Ptr<Model> &second,
       // second half will be available when complete.
       Response response =
           combine(std::move(source_to_pivot), std::move(pivot_to_target));
-      promise->set_value(std::move(response));
       // Fire once per input, when both legs are done — same per-input
       // granularity as the direct translate path.
       if (on_progress) {
         on_progress();
       }
+      promise->set_value(std::move(response));
       return nullptr;
     };
 
