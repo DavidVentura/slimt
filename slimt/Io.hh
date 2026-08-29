@@ -1,8 +1,10 @@
 #pragma once
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -69,7 +71,12 @@ class MmapFile {
   void consume(MmapFile& from);
   void reset();
 
+#ifdef _WIN32
+  void* file_ = nullptr;
+  void* mapping_ = nullptr;
+#else
   int fd_ = -1;
+#endif
   void* data_ = nullptr;
   size_t size_ = 0;
 };

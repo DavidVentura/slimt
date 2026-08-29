@@ -1,11 +1,10 @@
 #include "slimt/Utils.hh"
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -118,7 +117,7 @@ std::tuple<Tensor, float> quantized_tensor_from_file(const std::string &fpath,
                                                      const Shape &shape,
                                                      const std::string &name) {
   auto file_exists = [](const std::string &fpath) {
-    return (access(fpath.c_str(), F_OK) == 0);
+    return std::filesystem::exists(fpath);
   };
 
   if (!file_exists(fpath)) {
@@ -151,7 +150,7 @@ template <class Scalar>
 Tensor tensor_from_file(const std::string &fpath, const Shape &shape,
                         const std::string &name) {
   auto file_exists = [](const std::string &fpath) {
-    return (access(fpath.c_str(), F_OK) == 0);
+    return std::filesystem::exists(fpath);
   };
 
   if (!file_exists(fpath)) {

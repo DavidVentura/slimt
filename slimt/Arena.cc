@@ -11,11 +11,23 @@ namespace {
 thread_local Arena* g_active_arena = nullptr;
 
 void* aligned_malloc(size_t alignment, size_t size) {
+#ifdef _WIN32
+  return _aligned_malloc(size, alignment);
+#else
   void* ptr = nullptr;
   if (posix_memalign(&ptr, alignment, size) != 0) {
     return nullptr;
   }
   return ptr;
+#endif
+}
+
+void aligned_free(void* ptr) {
+#ifdef _WIN32
+  _aligned_free(ptr);
+#else
+  std::free(ptr);
+#endif
 }
 }  // namespace
 
@@ -23,7 +35,7 @@ Arena* active_arena() { return g_active_arena; }
 
 Arena::Chunk::Chunk(size_t cap)
     : data(static_cast<uint8_t*>(aligned_malloc(kAlignWidth, cap)),
-           &std::free),
+           &aligned_free),
       capacity(cap) {}
 
 Arena::Arena(size_t initial_chunk_bytes)

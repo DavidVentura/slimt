@@ -1,9 +1,17 @@
 #include "slimt/Io.hh"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+// windows.h defines min/max as macros, which breaks std::min/std::max in every
+// header that transitively includes this one.
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cassert>
 #include <cstdint>
@@ -357,6 +365,47 @@ std::ostream& operator<<(std::ostream& out, const Item& item) {
   return out;
 }
 
+#ifdef _WIN32
+MmapFile::MmapFile(const std::string& filepath) {
+  file_ = CreateFileA(filepath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file_ == INVALID_HANDLE_VALUE) {
+    throw std::runtime_error("Failed to open file: " + filepath);
+  }
+
+  LARGE_INTEGER size;
+  if (GetFileSizeEx(file_, &size) == 0) {
+    CloseHandle(file_);
+    throw std::runtime_error("Failed to get file size: " + filepath);
+  }
+  size_ = static_cast<size_t>(size.QuadPart);
+
+  mapping_ = CreateFileMappingA(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  if (mapping_ == nullptr) {
+    CloseHandle(file_);
+    throw std::runtime_error("Failed to mmap file: " + filepath);
+  }
+
+  data_ = MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+  if (data_ == nullptr) {
+    CloseHandle(mapping_);
+    CloseHandle(file_);
+    throw std::runtime_error("Failed to mmap file: " + filepath);
+  }
+}
+
+MmapFile::~MmapFile() {
+  if (data_ != nullptr) {
+    UnmapViewOfFile(data_);
+  }
+  if (mapping_ != nullptr) {
+    CloseHandle(mapping_);
+  }
+  if (file_ != nullptr && file_ != INVALID_HANDLE_VALUE) {
+    CloseHandle(file_);
+  }
+}
+#else
 MmapFile::MmapFile(const std::string& filepath) {
   fd_ = open(filepath.c_str(), O_RDONLY);
   if (fd_ == -1) {
@@ -385,9 +434,16 @@ MmapFile::~MmapFile() {
     close(fd_);
   }
 }
+#endif
 
 MmapFile::MmapFile(MmapFile&& from) noexcept
-    : fd_(from.fd_), data_(from.data_), size_(from.size_) {
+    : data_(from.data_), size_(from.size_) {
+#ifdef _WIN32
+  file_ = from.file_;
+  mapping_ = from.mapping_;
+#else
+  fd_ = from.fd_;
+#endif
   from.reset();
 }
 
@@ -400,14 +456,24 @@ MmapFile& MmapFile::operator=(MmapFile&& from) noexcept {
 }
 
 void MmapFile::consume(MmapFile& from) {
+#ifdef _WIN32
+  file_ = from.file_;
+  mapping_ = from.mapping_;
+#else
   fd_ = (from.fd_);
+#endif
   data_ = (from.data_);
   size_ = (from.size_);
   from.reset();
 }
 
 void MmapFile::reset() {
+#ifdef _WIN32
+  file_ = nullptr;
+  mapping_ = nullptr;
+#else
   fd_ = -1;
+#endif
   data_ = nullptr;
   size_ = 0;
 }

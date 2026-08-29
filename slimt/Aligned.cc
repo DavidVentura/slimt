@@ -58,16 +58,24 @@ void* Aligned::allocate(size_t alignment, size_t size) {
     aligned_size += alignment;
   }
   assert(aligned_size >= size);
+#ifdef _WIN32
+  return _aligned_malloc(aligned_size, alignment);
+#else
   void* ptr = nullptr;
   if (posix_memalign(&ptr, alignment, aligned_size) != 0) {
     return nullptr;
   }
   return ptr;
+#endif
 }
 
 void Aligned::release() {
   if (data_ != nullptr && !from_arena_) {
+#ifdef _WIN32
+    _aligned_free(data_);
+#else
     free(data_);
+#endif
   }
   data_ = nullptr;
   size_ = 0;
