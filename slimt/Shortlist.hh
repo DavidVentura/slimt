@@ -84,6 +84,13 @@ class ShortlistGenerator {
   const uint64_t* word_to_offset_;
   const Word* shortlist_;
 
+  // Every digit-only target piece. The table is built from one deterministic
+  // segmentation of the corpus while the model trained under subword sampling,
+  // so a number's alternative pieces ("404" as ▁4+04) are often unreachable
+  // and a digit gets dropped or doubled. Admitting all digit pieces whenever
+  // the source holds one makes number copying independent of the table.
+  Words digit_targets_;
+
   struct Header {
     uint64_t magic;                // BINARY_SHORTLIST_MAGIC
     uint64_t checksum;             // hash([&frequent, eof]).

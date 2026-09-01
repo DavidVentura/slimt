@@ -136,6 +136,12 @@ ShortlistGenerator::ShortlistGenerator(                        //
   load(view.data, view.size, check);
 
   (void)source_index_;
+
+  for (Word i = 0; i < target_.size(); ++i) {
+    if (target_.is_digit_piece(i)) {
+      digit_targets_.push_back(i);
+    }
+  }
 }
 
 Shortlist ShortlistGenerator::generate(const Words& words,
@@ -153,12 +159,15 @@ Shortlist ShortlistGenerator::generate(const Words& words,
     target_table[i] = true;
   }
 
+  bool source_has_digit = false;
+
   // Collect unique words from source.
   // Add aligned target words: mark target_table[word] to 1
   for (auto word : words) {
     if (shared_) {
       target_table[word] = true;
     }
+    source_has_digit = source_has_digit || source_.is_digit_piece(word);
     // If word has not been encountered, add the corresponding target
     // words
     if (!source_table[word]) {
@@ -189,6 +198,25 @@ Shortlist ShortlistGenerator::generate(const Words& words,
     if (!target_table[i]) {
       target_table[i] = true;
       target_table_ones++;
+    }
+  }
+
+  // Digit pieces come after the frequency top-up so they never displace the
+  // frequent pieces that budget exists to supply; the alignment pad is then
+  // redone because they may have broken the multiple.
+  if (source_has_digit) {
+    for (Word digit : digit_targets_) {
+      if (!target_table[digit]) {
+        target_table[digit] = true;
+        target_table_ones++;
+      }
+    }
+    for (size_t i = frequent_;
+         i < target_size && target_table_ones % kVExtAlignment != 0; i++) {
+      if (!target_table[i]) {
+        target_table[i] = true;
+        target_table_ones++;
+      }
     }
   }
 

@@ -42,6 +42,20 @@ class Vocabulary {
   // that attaches without a space). Mid-word continuation subwords — including
   // multi-byte accented letters — return false, so expansion keeps consuming
   // them.
+  // Whether `word`'s piece is digits only, with or without the leading
+  // metaspace marker. Numbers must survive translation regardless of what the
+  // lexical shortlist learned about them, so the shortlist generator keys on
+  // this to admit every digit piece whenever the source carries one.
+  bool is_digit_piece(Word word) const {
+    if (word >= size()) return false;
+    const std::string &piece = processor_.IdToPiece(static_cast<int>(word));
+    size_t begin = is_word_start(word) ? 3 : 0;
+    if (begin >= piece.size()) return false;
+    return std::all_of(piece.begin() + begin, piece.end(), [](char c) {
+      return std::isdigit(static_cast<unsigned char>(c));
+    });
+  }
+
   bool ends_word(Word word) const {
     if (word >= size()) return true;
     if (is_word_start(word)) return true;
